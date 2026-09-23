@@ -58,3 +58,4 @@ gui = ["PySide6"]
 
 [tool.poetry.scripts]
 camoufox = "camoufox.__main__:cli"
+reverse-browser = "camoufox.reverse_cli:cli"

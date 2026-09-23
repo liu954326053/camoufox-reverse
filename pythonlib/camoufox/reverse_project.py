@@ -233,6 +233,49 @@ class ReverseProject:
                 raise
         raise ProjectError("Cannot allocate a unique session id")
 
+    def get_session(self, session_id: str) -> "ReverseSession":
+        """Load an existing session without changing its lifecycle state."""
+        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+            raise ProjectError("Invalid session id")
+        if self.runs_dir.is_symlink() or not self.runs_dir.is_dir():
+            raise ProjectError("Project runs directory is invalid")
+        session_path = self.runs_dir / session_id
+        if session_path.is_symlink() or not session_path.is_dir():
+            raise ProjectError("Session directory is invalid")
+        if session_path.resolve(strict=True).parent != self.runs_dir.resolve(strict=True):
+            raise ProjectError("Session directory is outside the project")
+        manifest = self._read_manifest(session_path / "manifest.json", session_id)
+        raw_dir = session_path / "raw"
+        if (
+            raw_dir.is_symlink()
+            or not raw_dir.is_dir()
+            or raw_dir.resolve(strict=True).parent != session_path.resolve(strict=True)
+        ):
+            raise ProjectError("Session evidence directory is invalid")
+        return ReverseSession(self, session_id, session_path, raw_dir, manifest)
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """Return safe lifecycle metadata for every valid project session."""
+        if self.runs_dir.is_symlink() or not self.runs_dir.is_dir():
+            raise ProjectError("Project runs directory is invalid")
+        sessions = []
+        for session_path in sorted(self.runs_dir.iterdir(), key=lambda item: item.name):
+            if not session_path.is_dir() or session_path.is_symlink():
+                raise ProjectError("Session directory is invalid")
+            session = self.get_session(session_path.name)
+            manifest = session._manifest
+            sessions.append(
+                {
+                    "session_id": session.session_id,
+                    "status": manifest["status"],
+                    "started_at": manifest["started_at"],
+                    "ended_at": manifest["ended_at"],
+                    "session_dir": str(session.path),
+                    "manifest": str(session.manifest_path),
+                }
+            )
+        return sessions
+
     def _resume_session(self, session_id: str) -> "ReverseSession":
         if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
             raise ProjectError("Invalid session id")
