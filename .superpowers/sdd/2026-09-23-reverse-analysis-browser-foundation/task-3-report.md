@@ -8,16 +8,20 @@ Implemented and verified on September 24, 2026.
 
 - Added `camoufox.reverse_launch.reverse_launch_options` with mandatory
   `project_dir` and optional session resume.
-- Added isolated `session.path/trace` creation and exposed it as
-  `session.trace_dir` for the reverse launch contract.
+- Added a stable public `ReverseSession.trace_dir` path and isolated
+  `session.path/trace` creation for the reverse launch contract.
 - Added explicit `overview`, `targeted`, and `deep` PropertyTracer profiles.
 - Merged `config.propertyTrace` without removing caller fingerprint settings or
   caller trace fields; `enabled` and the session `logDir` are enforced.
 - Normalized proxy URLs into Playwright's `{server, username, password}` form.
   Credentials are not written to the manifest or printed.
 - Passed `browser_version` through the existing `browser` launch selector.
-- Updated the session manifest to `running` only after launch options succeed,
-  recording the selected profile, browser selector, and redacted proxy metadata.
+- Added public `ReverseSession.mark_running(...)` lifecycle transition that
+  reads the current manifest before atomically recording the selected profile,
+  browser selector, and redacted proxy metadata.
+- Any post-session initialization failure, including proxy validation and
+  `launch_options()` failure, calls public `session.mark_incomplete(...)` before
+  re-raising the original exception.
 - Exported `reverse_launch_options` from `camoufox` while leaving ordinary
   `launch_options` unchanged.
 
@@ -26,11 +30,11 @@ Implemented and verified on September 24, 2026.
 Commands run from `pythonlib`:
 
 ```text
-python3 -m pytest tests/test_reverse_launch.py -q
-7 passed
+python3 -m pytest tests/test_reverse_launch.py tests/test_reverse_project.py -q
+43 passed
 
-python3 -m pytest tests/test_reverse_launch.py tests/test_server.py tests/test_reverse_project.py -q
-45 passed
+python3 -m pytest tests/test_reverse_launch.py tests/test_server.py -q
+15 passed
 ```
 
 Additional checks:
@@ -40,10 +44,6 @@ Additional checks:
 
 ## Concerns
 
-- Task 1's committed `ReverseSession` does not expose a native `trace_dir`
-  property or a public `running` transition method. Task 3 keeps the requested
-  file boundary by attaching `trace_dir` during reverse launch and using the
-  existing atomic manifest writer for the status update. A later compatibility
-  cleanup can move those lifecycle primitives into `reverse_project.py`.
 - The profile object whitelist and event caps are launch-layer defaults. The
   native tracer still owns event filtering and runtime behavior.
+- Full `pythonlib` verification passed with `241 passed, 4 skipped`.
