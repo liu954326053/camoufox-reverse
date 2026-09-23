@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import threading
 
 import pytest
 
@@ -244,6 +245,39 @@ def test_resume_rejects_manifest_with_non_directory_raw(tmp_path):
         project.create_session(resume_session=session.session_id)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("schema", None),
+        ("session_id", None),
+        ("status", None),
+        ("capture_mode", None),
+        ("contains_sensitive_data", "yes"),
+        ("telemetry", 0),
+        ("started_at", None),
+        ("ended_at", None),
+        ("ended_at", 123),
+        ("event_loss", "0"),
+        ("artifacts", {}),
+    ],
+)
+def test_resume_rejects_manifest_with_missing_or_invalid_required_field(
+    tmp_path, field, value
+):
+    project = ReverseProject.open(tmp_path / "analysis")
+    session = project.create_session()
+    session.mark_incomplete()
+    manifest = json.loads(session.manifest_path.read_text())
+    if value is None:
+        del manifest[field]
+    else:
+        manifest[field] = value
+    session.manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ProjectError):
+        project.create_session(resume_session=session.session_id)
+
+
 @pytest.mark.parametrize("method", ["close", "mark_incomplete"])
 def test_stale_resumed_handle_cannot_overwrite_completed_session(tmp_path, method):
     project = ReverseProject.open(tmp_path / "analysis")
@@ -256,6 +290,58 @@ def test_stale_resumed_handle_cannot_overwrite_completed_session(tmp_path, metho
         getattr(resumed, method)()
 
     assert json.loads(original.manifest_path.read_text())["status"] == "complete"
+
+
+def test_concurrent_close_serializes_stale_handles(tmp_path, monkeypatch):
+    session = ReverseProject.open(tmp_path / "analysis").create_session()
+    write_started = threading.Event()
+    release_write = threading.Event()
+    second_read = threading.Event()
+    write_count = 0
+    write_count_lock = threading.Lock()
+    original_write = reverse_project._write_manifest
+    original_read = ReverseProject._read_manifest
+
+    def delayed_write(path, manifest):
+        nonlocal write_count
+        with write_count_lock:
+            write_count += 1
+            first_write = write_count == 1
+        if first_write:
+            write_started.set()
+            assert release_write.wait(2)
+        return original_write(path, manifest)
+
+    def observed_read(path, session_id):
+        if write_started.is_set():
+            second_read.set()
+        return original_read(path, session_id)
+
+    monkeypatch.setattr(reverse_project, "_write_manifest", delayed_write)
+    monkeypatch.setattr(ReverseProject, "_read_manifest", staticmethod(observed_read))
+    results = []
+
+    def close_session():
+        try:
+            session.close()
+            results.append("ok")
+        except ProjectError:
+            results.append("rejected")
+
+    first = threading.Thread(target=close_session)
+    second = threading.Thread(target=close_session)
+    first.start()
+    assert write_started.wait(2)
+    second.start()
+    assert not second_read.wait(0.2)
+    release_write.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(results) == ["ok", "rejected"]
+    assert json.loads(session.manifest_path.read_text())["status"] == "complete"
 
 
 def test_failed_session_initialization_removes_partial_directory(tmp_path, monkeypatch):

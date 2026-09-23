@@ -7,7 +7,9 @@ import os
 import re
 import shutil
 import stat
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Union
@@ -15,6 +17,19 @@ from typing import Any, Union
 
 PathLike = Union[str, os.PathLike[str]]
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_SESSION_LOCKS: dict[str, threading.RLock] = {}
+_SESSION_LOCKS_GUARD = threading.Lock()
+_REQUIRED_MANIFEST_TYPES = {
+    "schema": int,
+    "session_id": str,
+    "status": str,
+    "capture_mode": str,
+    "contains_sensitive_data": bool,
+    "telemetry": bool,
+    "started_at": str,
+    "event_loss": int,
+    "artifacts": list,
+}
 
 
 class ProjectError(RuntimeError):
@@ -65,6 +80,41 @@ def _fsync_directory(path: Path) -> None:
         pass
     finally:
         os.close(descriptor)
+
+
+def _thread_lock_for(path: Path) -> threading.RLock:
+    key = str(path)
+    with _SESSION_LOCKS_GUARD:
+        return _SESSION_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def _session_lock(path: Path):
+    """Serialize lifecycle transitions in-process and across POSIX processes."""
+    if path.is_symlink():
+        raise ProjectError("Session directory cannot be a symlink")
+    lock_path = path / ".lifecycle.lock"
+    if lock_path.is_symlink():
+        raise ProjectError("Session lock cannot be a symlink")
+    thread_lock = _thread_lock_for(path)
+    with thread_lock:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise ProjectError("Cannot acquire session lock") from exc
+        try:
+            try:
+                import fcntl
+            except ImportError:
+                fcntl = None
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
 
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
@@ -193,21 +243,22 @@ class ReverseProject:
             raise ProjectError("Session directory is invalid")
         if session_path.resolve(strict=True).parent != self.runs_dir.resolve(strict=True):
             raise ProjectError("Session directory is outside the project")
-        manifest_path = session_path / "manifest.json"
-        manifest = self._read_manifest(manifest_path, session_id)
-        if manifest.get("status") != "incomplete":
-            raise ProjectError("Only incomplete sessions can be resumed")
-        raw_dir = session_path / "raw"
-        if (
-            raw_dir.is_symlink()
-            or not raw_dir.is_dir()
-            or raw_dir.resolve(strict=True).parent != session_path.resolve(strict=True)
-        ):
-            raise ProjectError("Session evidence directory is incomplete")
+        with _session_lock(session_path):
+            manifest_path = session_path / "manifest.json"
+            manifest = self._read_manifest(manifest_path, session_id)
+            if manifest.get("status") != "incomplete":
+                raise ProjectError("Only incomplete sessions can be resumed")
+            raw_dir = session_path / "raw"
+            if (
+                raw_dir.is_symlink()
+                or not raw_dir.is_dir()
+                or raw_dir.resolve(strict=True).parent != session_path.resolve(strict=True)
+            ):
+                raise ProjectError("Session evidence directory is incomplete")
 
-        manifest["status"] = "starting"
-        manifest["ended_at"] = None
-        _write_manifest(manifest_path, manifest)
+            manifest["status"] = "starting"
+            manifest["ended_at"] = None
+            _write_manifest(manifest_path, manifest)
         return ReverseSession(self, session_id, session_path, raw_dir, manifest)
 
     @staticmethod
@@ -218,12 +269,24 @@ class ReverseProject:
             manifest = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ProjectError("Cannot read session manifest") from exc
-        if (
-            not isinstance(manifest, dict)
-            or manifest.get("schema") != 1
-            or manifest.get("session_id") != session_id
-        ):
+        if not isinstance(manifest, dict):
             raise ProjectError("Session manifest identity is invalid")
+        for field, expected_type in _REQUIRED_MANIFEST_TYPES.items():
+            if field not in manifest or type(manifest[field]) is not expected_type:
+                raise ProjectError("Session manifest shape is invalid")
+        if "ended_at" not in manifest:
+            raise ProjectError("Session manifest shape is invalid")
+        if (
+            manifest["schema"] != 1
+            or manifest["session_id"] != session_id
+            or manifest["status"] not in {"starting", "running", "incomplete", "complete"}
+            or manifest["capture_mode"] != "raw"
+            or not manifest["started_at"]
+            or manifest["event_loss"] < 0
+        ):
+            raise ProjectError("Session manifest values are invalid")
+        if manifest["ended_at"] is not None and type(manifest["ended_at"]) is not str:
+            raise ProjectError("Session manifest shape is invalid")
         return manifest
 
 
@@ -267,13 +330,14 @@ class ReverseSession:
     def close(self, status: str = "complete") -> None:
         if status not in {"complete", "incomplete"}:
             raise ProjectError("Invalid session final status")
-        manifest = self.project._read_manifest(self.manifest_path, self.session_id)
-        if manifest.get("status") == "complete":
-            raise ProjectError("Complete sessions are immutable")
-        manifest["status"] = status
-        manifest["ended_at"] = _timestamp()
-        _write_manifest(self.manifest_path, manifest)
-        self._manifest = manifest
+        with _session_lock(self.path):
+            manifest = self.project._read_manifest(self.manifest_path, self.session_id)
+            if manifest.get("status") == "complete":
+                raise ProjectError("Complete sessions are immutable")
+            manifest["status"] = status
+            manifest["ended_at"] = _timestamp()
+            _write_manifest(self.manifest_path, manifest)
+            self._manifest = manifest
 
     def mark_running(
         self,
@@ -283,19 +347,20 @@ class ReverseSession:
         proxy: dict[str, Any] | None = None,
     ) -> None:
         """Transition a newly created or resumed session into ``running``."""
-        manifest = self.project._read_manifest(self.manifest_path, self.session_id)
-        if manifest.get("status") != "starting":
-            raise ProjectError("Only starting sessions can be marked running")
-        manifest["status"] = "running"
-        manifest["ended_at"] = None
-        if trace_profile is not None:
-            manifest["trace_profile"] = trace_profile
-        if browser_version is not None:
-            manifest["browser_version"] = browser_version
-        if proxy is not None:
-            manifest["proxy"] = proxy
-        _write_manifest(self.manifest_path, manifest)
-        self._manifest = manifest
+        with _session_lock(self.path):
+            manifest = self.project._read_manifest(self.manifest_path, self.session_id)
+            if manifest.get("status") != "starting":
+                raise ProjectError("Only starting sessions can be marked running")
+            manifest["status"] = "running"
+            manifest["ended_at"] = None
+            if trace_profile is not None:
+                manifest["trace_profile"] = trace_profile
+            if browser_version is not None:
+                manifest["browser_version"] = browser_version
+            if proxy is not None:
+                manifest["proxy"] = proxy
+            _write_manifest(self.manifest_path, manifest)
+            self._manifest = manifest
 
     def mark_incomplete(self, error: BaseException | None = None) -> None:
         del error
