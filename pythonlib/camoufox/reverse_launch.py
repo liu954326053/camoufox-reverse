@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 
-from .reverse_project import ReverseProject, ReverseSession, _write_manifest
+from .reverse_project import ReverseProject, ReverseSession
 from .utils import launch_options
 
 
@@ -62,7 +62,7 @@ def _proxy_dict(proxy_url: str) -> dict[str, str]:
 
 
 def _trace_dir(session: ReverseSession) -> Path:
-    trace_dir = session.path / "trace"
+    trace_dir = session.trace_dir
     if trace_dir.is_symlink():
         raise ValueError("session trace directory cannot be a symlink")
     trace_dir.mkdir(mode=0o700, exist_ok=True)
@@ -74,38 +74,7 @@ def _trace_dir(session: ReverseSession) -> Path:
         trace_dir.chmod(0o700)
     except OSError as exc:
         raise ValueError("session trace directory is not secure") from exc
-    # Task 1's session object predates the trace directory accessor. Keep the
-    # public interface promised by the reverse launch contract without
-    # changing the already-stable project/session module.
-    session.trace_dir = trace_dir  # type: ignore[attr-defined]
     return trace_dir
-
-
-def _mark_running(
-    session: ReverseSession,
-    *,
-    trace_profile: str,
-    proxy: dict[str, str] | None,
-    browser_version: str | None,
-) -> None:
-    manifest = dict(session._manifest)
-    manifest.update(
-        {
-            "status": "running",
-            "trace_profile": trace_profile,
-            "browser_version": browser_version,
-            "proxy": (
-                {
-                    "server": proxy["server"],
-                    "authenticated": "username" in proxy or "password" in proxy,
-                }
-                if proxy
-                else None
-            ),
-        }
-    )
-    _write_manifest(session.manifest_path, manifest)
-    session._manifest = manifest
 
 
 def reverse_launch_options(
@@ -131,35 +100,48 @@ def reverse_launch_options(
 
     project = ReverseProject.open(project_dir)
     session = project.create_session(resume_session=resume_session)
-    trace_dir = _trace_dir(session)
+    try:
+        trace_dir = _trace_dir(session)
 
-    config = dict(kwargs.pop("config", None) or {})
-    caller_trace = config.get("propertyTrace", {})
-    if caller_trace is None:
-        caller_trace = {}
-    if not isinstance(caller_trace, Mapping):
-        raise TypeError("config.propertyTrace must be a mapping")
-    trace_config = {
-        **profile,
-        **dict(caller_trace),
-        "enabled": True,
-        "logDir": str(trace_dir),
-    }
-    config["propertyTrace"] = trace_config
+        config = dict(kwargs.pop("config", None) or {})
+        caller_trace = config.get("propertyTrace", {})
+        if caller_trace is None:
+            caller_trace = {}
+        if not isinstance(caller_trace, Mapping):
+            raise TypeError("config.propertyTrace must be a mapping")
+        trace_config = {
+            **profile,
+            **dict(caller_trace),
+            "enabled": True,
+            "logDir": str(trace_dir),
+        }
+        config["propertyTrace"] = trace_config
 
-    launch_kwargs = dict(kwargs)
-    launch_kwargs["config"] = config
-    normalized_proxy = _proxy_dict(proxy) if proxy is not None else launch_kwargs.get("proxy")
-    if proxy is not None:
-        launch_kwargs["proxy"] = normalized_proxy
-    if browser_version is not None:
-        launch_kwargs["browser"] = browser_version
+        launch_kwargs = dict(kwargs)
+        launch_kwargs["config"] = config
+        normalized_proxy = (
+            _proxy_dict(proxy) if proxy is not None else launch_kwargs.get("proxy")
+        )
+        if proxy is not None:
+            launch_kwargs["proxy"] = normalized_proxy
+        if browser_version is not None:
+            launch_kwargs["browser"] = browser_version
 
-    options = launch_options(**launch_kwargs)
-    _mark_running(
-        session,
-        trace_profile=trace_profile,
-        proxy=normalized_proxy,
-        browser_version=browser_version or launch_kwargs.get("browser"),
-    )
-    return options, session
+        options = launch_options(**launch_kwargs)
+        session.mark_running(
+            trace_profile=trace_profile,
+            browser_version=browser_version or launch_kwargs.get("browser"),
+            proxy=(
+                {
+                    "server": normalized_proxy["server"],
+                    "authenticated": "username" in normalized_proxy
+                    or "password" in normalized_proxy,
+                }
+                if normalized_proxy
+                else None
+            ),
+        )
+        return options, session
+    except Exception as error:
+        session.mark_incomplete(error)
+        raise

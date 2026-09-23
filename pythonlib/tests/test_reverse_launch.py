@@ -96,6 +96,42 @@ def test_reverse_launch_rejects_unknown_trace_profile(tmp_path, monkeypatch):
     assert called is False
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("launch failed"),
+        ValueError("browser selector is invalid"),
+    ],
+)
+def test_reverse_launch_marks_session_incomplete_on_initialization_failure(
+    tmp_path, monkeypatch, failure
+):
+    def fail_launch_options(**kwargs):
+        raise failure
+
+    monkeypatch.setattr("camoufox.reverse_launch.launch_options", fail_launch_options)
+
+    with pytest.raises(type(failure), match=str(failure)):
+        reverse_launch_options(
+            project_dir=tmp_path / "p",
+            proxy="http://127.0.0.1:7890",
+            browser_version="official/beta.20",
+        )
+
+    manifests = list((tmp_path / "p" / "runs").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    assert json.loads(manifests[0].read_text())["status"] == "incomplete"
+
+
+def test_reverse_launch_marks_session_incomplete_when_proxy_validation_fails(tmp_path):
+    with pytest.raises(ValueError, match="proxy"):
+        reverse_launch_options(project_dir=tmp_path / "p", proxy="not-a-url")
+
+    manifests = list((tmp_path / "p" / "runs").glob("*/manifest.json"))
+    assert len(manifests) == 1
+    assert json.loads(manifests[0].read_text())["status"] == "incomplete"
+
+
 def test_ordinary_launch_options_remains_exported():
     assert callable(ordinary_launch_options)
     assert ordinary_launch_options.__module__ == "camoufox.utils"

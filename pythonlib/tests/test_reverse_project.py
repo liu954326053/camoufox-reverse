@@ -78,6 +78,36 @@ def test_each_launch_gets_a_unique_isolated_session(tmp_path):
     assert first.raw_dir != second.raw_dir
 
 
+def test_session_exposes_trace_dir_as_a_stable_public_path(tmp_path):
+    session = ReverseProject.open(tmp_path / "analysis").create_session()
+
+    assert session.trace_dir == session.path / "trace"
+
+
+def test_mark_running_updates_manifest_through_public_lifecycle_api(tmp_path):
+    session = ReverseProject.open(tmp_path / "analysis").create_session()
+
+    session.mark_running(
+        trace_profile="targeted",
+        browser_version="official/beta.20",
+        proxy={"server": "http://127.0.0.1:7890", "authenticated": False},
+    )
+
+    manifest = json.loads(session.manifest_path.read_text())
+    assert manifest["status"] == "running"
+    assert manifest["trace_profile"] == "targeted"
+    assert manifest["browser_version"] == "official/beta.20"
+    assert manifest["proxy"]["server"] == "http://127.0.0.1:7890"
+
+
+def test_mark_running_rejects_a_completed_session(tmp_path):
+    session = ReverseProject.open(tmp_path / "analysis").create_session()
+    session.close()
+
+    with pytest.raises(ProjectError):
+        session.mark_running()
+
+
 def test_session_manifest_is_created_with_raw_capture_defaults(tmp_path):
     session = ReverseProject.open(tmp_path / "analysis").create_session()
 

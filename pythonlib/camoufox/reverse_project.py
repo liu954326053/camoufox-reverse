@@ -242,6 +242,7 @@ class ReverseSession:
         self.session_id = session_id
         self.path = path
         self.raw_dir = raw_dir
+        self.trace_dir = path / "trace"
         self.manifest_path = path / "manifest.json"
         self._manifest = manifest
 
@@ -271,6 +272,28 @@ class ReverseSession:
             raise ProjectError("Complete sessions are immutable")
         manifest["status"] = status
         manifest["ended_at"] = _timestamp()
+        _write_manifest(self.manifest_path, manifest)
+        self._manifest = manifest
+
+    def mark_running(
+        self,
+        *,
+        trace_profile: str | None = None,
+        browser_version: str | None = None,
+        proxy: dict[str, Any] | None = None,
+    ) -> None:
+        """Transition a newly created or resumed session into ``running``."""
+        manifest = self.project._read_manifest(self.manifest_path, self.session_id)
+        if manifest.get("status") != "starting":
+            raise ProjectError("Only starting sessions can be marked running")
+        manifest["status"] = "running"
+        manifest["ended_at"] = None
+        if trace_profile is not None:
+            manifest["trace_profile"] = trace_profile
+        if browser_version is not None:
+            manifest["browser_version"] = browser_version
+        if proxy is not None:
+            manifest["proxy"] = proxy
         _write_manifest(self.manifest_path, manifest)
         self._manifest = manifest
 
