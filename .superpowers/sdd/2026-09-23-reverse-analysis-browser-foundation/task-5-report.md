@@ -4,7 +4,9 @@
 
 FIXED
 
-Implementation commit: `d08102e` (`fix: persist property tracer session loss metadata`).
+Implementation commit: `fix: persist property tracer session loss metadata` (the
+final commit is reported with the delivery result because amending this report
+changes the commit hash).
 
 ## Scope
 
