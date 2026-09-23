@@ -4,7 +4,7 @@
 
 **Goal:** 在 `camoufox-reverse` 的 Python 启动层建立工程目录、隔离 session、原始证据落盘、索引重建和 CLI/MCP 可复用的基础平台。
 
-**Architecture:** 新增一个与普通 Camoufox API 隔离的 reverse project/session 核心。它负责校验 `project_dir`、创建 session、生成 manifest、注入 PropertyTracer 的 `logDir`，并提供原始证据索引；同步/异步启动器和 CLI 只调用这套核心。MCP 桥接不在当前仓库中，因此先固定 Python API 和 JSON 契约，外部 MCP 适配器随后调用相同接口。
+**Architecture:** 新增一个与普通 Camoufox API 隔离的 reverse project/session 核心。它负责校验 `project_dir`、创建 session、生成 manifest、注入 PropertyTracer 的 `logDir`，并提供原始证据索引；同步/异步启动器、CLI 和外部 MCP 桥接只调用这套核心。MCP 桥接源码位于本机独立 checkout，Task 8 将把已确认的 JSON 契约接入真实 `launch_browser`、trace 和 artifact 生命周期。
 
 **Tech Stack:** Python 3.10+、现有 `pathlib`/`json`/`orjson`、Click、Playwright Python、Camoufox `CAMOU_CONFIG`/PropertyTracer、pytest。
 
@@ -34,6 +34,14 @@
 - Test: `pythonlib/tests/test_reverse_cli.py` — CLI 参数和 JSON 输出。
 - Modify: `tests/test_property_tracer_runtime.py` — 补充外部 `logDir` session 目录验收所需的最小运行断言。
 - Test: `tests/test_reverse_project_contract.py` — native tracer 与工程 session 路径契约。
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/__main__.py` — MCP 启动参数。
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/browser.py` — browser/session 传递和关闭生命周期。
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/property_trace.py` — project-scoped trace root。
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/tools/navigation.py` — `launch_browser(project_dir, capture_profile, ...)`。
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/tools/trace.py` — session-scoped trace queries。
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/tools/environment.py` — session-aware environment report。
+- Test: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/tests/test_browser.py` — real MCP browser lifecycle contract。
+- Test: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/tests/test_tools.py` — tool request/error/path contract。
 - Create: `docs/superpowers/plans/2026-09-23-reverse-analysis-browser-foundation.md` — 本计划。
 - Later, separate plan: SpiderMonkey 深度执行 hook、VM adapter 和值生成链分析，不在本计划实施。
 
@@ -586,9 +594,71 @@ git add pythonlib/tests/test_reverse_integration.py README.md docs/releases/_tem
 git commit -m "test: verify reverse browser foundation"
 ```
 
+### Task 8: Integrate the External MCP Bridge
+
+**Files:**
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/__main__.py`
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/browser.py`
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/property_trace.py`
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/tools/navigation.py`
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/tools/trace.py`
+- Modify: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/src/camoufox_reverse_mcp/tools/environment.py`
+- Test: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/tests/test_browser.py`
+- Test: `/Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source/tests/test_tools.py`
+
+**Interfaces:**
+- Consumes: Task 6 JSON contract and Task 3/4 Python project/session APIs.
+- Produces: actual MCP calls that create project-scoped sessions and never fall back to `~/.cache/camoufox-reverse` for an opted-in project.
+
+- [ ] **Step 1: Add failing bridge tests for mandatory project and raw capture**
+
+Test `launch_browser` rejects missing, empty, relative and escaping project paths; accepts `capture_profile="raw"`; returns `session_id`, `session_dir`, `manifest` and `trace_dir`; and rejects unknown profiles before browser startup.
+
+- [ ] **Step 2: Run the external MCP focused tests and verify failure**
+
+```sh
+cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
+.venv/bin/python -m pytest tests/test_browser.py tests/test_tools.py -q
+```
+
+Expected: the new project/session contract tests fail against the current cache-root implementation.
+
+- [ ] **Step 3: Thread project/session configuration through MCP startup**
+
+Add `--project-dir` to the MCP process entrypoint and `project_dir`/`capture_profile` to `launch_browser`. `BrowserManager` must create exactly one session through the Python core, pass its trace root into `propertyTrace.logDir`, and retain the session until `close_browser()`.
+
+- [ ] **Step 4: Make trace and environment tools session-aware**
+
+Replace module-global `CACHE_DIR`, `CONTROL_DIR` and `TRACES_DIR` reads with the active session paths. `list_trace_files`, `query_trace_file`, `trace_property_access`, `collect_values`, and `check_environment` must return explicit paths inside the active session. No adapter-local temporary artifact path may be returned.
+
+- [ ] **Step 5: Enforce raw artifact and close/error behavior**
+
+Persist network captures, script saves, screenshots, state exports and trace files through the active session store. Normalize and resolve every returned path before containment checks. On launch failure, mark the session `incomplete`; on close, finalize the manifest; on a second close, return an already-closed status without creating a session.
+
+- [ ] **Step 6: Run external MCP tests and the Python contract tests**
+
+```sh
+cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
+.venv/bin/python -m pytest tests/test_browser.py tests/test_tools.py -q
+cd /Users/magic/Workspace/camoufox-reverse/pythonlib
+python3 -m pytest tests/test_reverse_mcp_contract.py -q
+```
+
+Expected: external bridge tests cover real lifecycle/path behavior and the repository contract remains green.
+
+- [ ] **Step 7: Commit external bridge changes in its own repository**
+
+```sh
+cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
+git add src tests
+git commit -m "feat: add project-scoped reverse browser sessions"
+```
+
+Record the external commit hash in the foundation ledger and report; do not copy the external repository into `camoufox-reverse`.
+
 ## Separate Follow-up Plan: Deep Execution and VM Analysis
 
-After this foundation passes, create a second plan before changing SpiderMonkey. That plan must cover:
+After this foundation and Task 8 pass, create a second plan before changing SpiderMonkey. That plan must cover:
 
 - the exact Firefox source version and patch points;
 - low-overhead script/frame tracing;
