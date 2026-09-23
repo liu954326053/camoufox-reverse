@@ -72,7 +72,6 @@ class PropertyTracer {
                      const char* site = nullptr) {
     const uint64_t generation = mGeneration.load(std::memory_order_acquire);
     if (!mEnabled.load(std::memory_order_acquire)) return;
-    if (mSaturated.load(std::memory_order_relaxed)) return;
     RecordSlow(object, property, value, kind, site, generation);
   }
 

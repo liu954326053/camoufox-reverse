@@ -100,6 +100,29 @@ int Run(const std::string& base) {
     tracer.Record("window", "innerWidth", nullptr, 0, "window.innerWidth@test");
   }
   tracer.Shutdown();
+
+  // A capped session must expose loss metadata before its status file is
+  // removed, so a session index can account for dropped events.
+  const std::string lossBase = base + "/loss-status";
+  std::filesystem::create_directories(std::filesystem::u8path(lossBase));
+  { std::ofstream file(std::filesystem::u8path(lossBase + "/desired.state")); file << "on"; }
+  tracer.Initialize(lossBase, {}, 2);
+  for (int i = 0; i < 5; ++i) {
+    tracer.Record("window", "innerWidth", nullptr, 0, "window.innerWidth@test");
+  }
+  const std::string lossControl = lossBase + "/control/control-" +
+                                  std::to_string(getpid()) + ".cmd";
+  const std::string lossStatus = lossBase + "/control/status-" +
+                                 std::to_string(getpid()) + ".state";
+  { std::ofstream file(std::filesystem::u8path(lossControl)); file << "off"; }
+  std::this_thread::sleep_for(std::chrono::milliseconds(180));
+  {
+    std::ifstream file(std::filesystem::u8path(lossStatus));
+    std::string state;
+    std::getline(file, state);
+    if (state.find("dropped=3") == std::string::npos) return 6;
+  }
+  tracer.Shutdown();
   return 0;
 }
 
@@ -159,23 +182,29 @@ class PropertyTracerRuntimeTests(unittest.TestCase):
             )
             subprocess.run([str(binary), str(trace_root)], check=True, timeout=20)
 
-            files = sorted((trace_root / "traces").glob("*.jsonl"))
-            self.assertEqual(len(files), 3)
-            sessions = []
+            files = sorted(trace_root.rglob("*.jsonl"))
+            self.assertEqual(len(files), 4)
+            self.assertTrue(all(trace_root in path.parents for path in files))
+            sessions = {}
             for path in files:
                 events = [json.loads(line) for line in path.read_text().splitlines()]
-                sessions.append(events)
+                sessions[path] = events
+                self.assertTrue({"k", "q", "u", "w", "s"} <= events[0].keys())
                 self.assertEqual([event["q"] for event in events], list(range(len(events))))
                 self.assertTrue(all(event["w"] > 0 and event["u"] >= 0 for event in events))
                 self.assertTrue(all(event["s"] for event in events))
 
-            self.assertEqual(len(sessions[0]), 1000)
-            self.assertEqual({event["k"] for event in sessions[0]}, {0, 1, 2})
-            self.assertEqual(len(sessions[1]), 25)
-            self.assertEqual({event["k"] for event in sessions[1]}, {2})
-            self.assertEqual(len(sessions[2]), 5)
-            self.assertEqual({event["k"] for event in sessions[2]}, {0})
-            self.assertEqual(list((trace_root / "control").glob("control-*.cmd")), [])
+            normal_sessions = [events for path, events in sessions.items()
+                               if path.parent == trace_root / "traces"]
+            loss_sessions = [events for path, events in sessions.items()
+                             if path.parent == trace_root / "loss-status" / "traces"]
+            self.assertEqual([len(events) for events in normal_sessions], [1000, 25, 5])
+            self.assertEqual({event["k"] for event in normal_sessions[0]}, {0, 1, 2})
+            self.assertEqual({event["k"] for event in normal_sessions[1]}, {2})
+            self.assertEqual({event["k"] for event in normal_sessions[2]}, {0})
+            self.assertEqual([len(events) for events in loss_sessions], [2])
+            self.assertEqual(list(trace_root.rglob("control-*.cmd")), [])
+            self.assertEqual(list(trace_root.rglob("status-*.state")), [])
 
 
 if __name__ == "__main__":

@@ -6,6 +6,13 @@
   "property_trace": true,
   "property_trace_protocol": 1,
   "property_trace_hooks": 77,
+  "property_trace_status_fields": [
+    "state",
+    "session_id",
+    "events",
+    "dropped",
+    "detail"
+  ],
   "property_trace_features": [
     "async_buffered_io",
     "event_kind",
@@ -14,6 +21,7 @@
     "sequence",
     "exclusive_session_files",
     "control_ack",
+    "loss_status",
     "utf8_paths",
     "process_scope"
   ]

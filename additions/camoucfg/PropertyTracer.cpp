@@ -354,7 +354,9 @@ void PropertyTracer::WriteStatus(const char* state, const char* detail) {
   if (mStatusPath.empty()) return;
   std::ofstream file(NativePath(mStatusPath), std::ios::trunc);
   if (!file) return;
-  file << state << " " << (mSessionId == 0 ? 0 : mSessionId - 1);
+  file << state << " " << (mSessionId == 0 ? 0 : mSessionId - 1)
+       << " events=" << mEventsThisSession
+       << " dropped=" << mDroppedEventsThisSession;
   if (detail) file << " " << detail;
   file << "\n";
   file.flush();
