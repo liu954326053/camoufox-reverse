@@ -1,0 +1,150 @@
+# Reverse Browser MCP Adapter Contract
+
+Version: `1`
+
+This document defines the JSON boundary between the external
+`mcp__camoufox_reverse` bridge and the reverse-browser Python APIs. The bridge
+is a thin adapter: project validation, session creation, browser ownership and
+artifact indexing remain in the Python APIs. The bridge must not create a
+second project/session implementation or invent temporary output locations.
+
+## Session Rules
+
+- `project_dir` is mandatory for `launch_browser`.
+- `project_dir` must be absolute, writable, and accepted by the Python project
+  API. A missing, unwritable, or symlink-escaping path is a launch error.
+- A successful launch creates one current session and returns a stable
+  `session_id` plus its explicit `session_dir`.
+- Every returned artifact path must be inside the current `session_dir` (the
+  current session directory).
+  Relative paths are not permitted in responses; neither are implicit paths
+  such as `/tmp/...`, process working-directory paths, or hidden adapter-owned
+  temporary directories.
+- Browser binaries, dependency caches, proxy credentials, cookies and other
+  secrets are not returned by this contract.
+- The bridge forwards JSON values and preserves IDs, status strings, counts and
+  explicit artifact references. Human-readable logs are not part of the
+  machine response.
+
+## Common JSON Shapes
+
+Successful responses may contain only these top-level fields:
+
+```json
+{
+  "status": "ok",
+  "session_id": "session-123",
+  "session_dir": "/absolute/project/.reverse-browser/sessions/session-123",
+  "browser_version": "152.0",
+  "count": 0,
+  "artifacts": {
+    "manifest": "/absolute/project/.reverse-browser/sessions/session-123/manifest.json"
+  },
+  "requests": [],
+  "scripts": [],
+  "page": {},
+  "trace": {}
+}
+```
+
+`artifacts` values are explicit absolute paths under `session_dir`. A method
+that has no artifact returns no `artifacts` field. Collection methods return a
+`count` when a count is meaningful; they do not return an unbounded implicit
+directory listing.
+
+Errors use the same JSON transport and contain no partial session:
+
+```json
+{
+  "status": "error",
+  "error": {
+    "code": "invalid_project_dir",
+    "message": "project_dir is required"
+  }
+}
+```
+
+The bridge should preserve `code` and `message` without converting an error
+into a successful status. Error responses must not contain artifact paths.
+
+## Methods
+
+### `launch_browser(project_dir, proxy, browser_version, trace_profile)`
+
+Request:
+
+```json
+{
+  "project_dir": "/absolute/project",
+  "proxy": "http://127.0.0.1:7890",
+  "browser_version": "152.0",
+  "trace_profile": "targeted"
+}
+```
+
+`project_dir` is required. `proxy`, `browser_version` and `trace_profile` are
+optional. `trace_profile` is one of `overview`, `targeted` or `deep`; the
+default is `overview` when omitted. The response includes `status`,
+`session_id`, `session_dir`, and explicit session artifacts such as `manifest`
+and `trace_dir` when they exist. A browser version mismatch, invalid project
+path or failed preflight returns an error without creating a half-built
+session.
+
+### `get_page_info()`
+
+Returns the current page URL, title and viewport information in `page`, plus
+the current `status` and `session_id` when a browser is active. It does not
+return browser internals or temporary profile paths.
+
+### `network_capture(action, url_pattern)`
+
+`action` is `start`, `stop`, `clear` or `status`. `url_pattern` is optional for
+`start` and uses the Python API's URL matching syntax. The response reports
+`status` and capture counts/status. If the API materializes a capture artifact,
+it is returned under `artifacts` and must be inside the current `session_dir`.
+
+### `list_network_requests(...)`
+
+Accepts the Python API's optional filters, including URL, domain, method,
+resource type and status code. Returns a JSON array of request records with
+stable request IDs, URL, method, response status, resource type, duration and
+size when available. Body data is returned only when explicitly supported by
+the underlying API; it must not cause an unreferenced file to be created.
+
+### `scripts(action, url)`
+
+`action` is `list`, `get` or `save`. `list` returns loaded script metadata.
+`get` returns the source for the requested script URL or inline identifier.
+`save` returns an explicit artifact path under the current `session_dir` and
+never a system temporary path. The bridge forwards the Python API's script
+identifier unchanged.
+
+### `trace_property_access(...)`
+
+Forwards the Python tracer options such as `duration`, `mode`, object/property
+filters, event limit and value collection. The response contains trace status,
+counts and, when persisted, explicit artifact references under `session_dir`.
+Large collected values may be represented by those explicit paths; the bridge
+must not expose an adapter-local cache path.
+
+### `export_state(save_path)`
+
+Exports cookies and storage using the current session. `save_path` must resolve
+inside the current `session_dir`; callers must not use this method to write
+outside the active project/session. The response contains `status` and the
+normalized explicit artifact path. An out-of-session path is rejected.
+
+### `close_browser()`
+
+Closes the active browser and releases its resources. Returns `status`, and
+the `session_id` when known. Closing is idempotent from the adapter's point of
+view; a second close reports an already-closed status rather than creating a
+new session or artifact.
+
+## Compatibility Requirements
+
+The adapter must call the existing Python APIs and preserve their validation
+and lifecycle semantics. It must not import or implement a separate MCP
+server, project manager, session allocator, path policy, or artifact index.
+Unknown request fields should be rejected or ignored according to the wrapped
+Python API, but must never be silently turned into filesystem paths.
