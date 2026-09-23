@@ -82,6 +82,7 @@ def reverse_launch_options(
     proxy: str | None = None,
     browser_version: str | None = None,
     trace_profile: str = "overview",
+    enable_trace: bool = True,
     resume_session: str | None = None,
     **kwargs: Any,
 ) -> tuple[dict[str, Any], ReverseSession]:
@@ -101,21 +102,23 @@ def reverse_launch_options(
     project = ReverseProject.open(project_dir)
     session = project.create_session(resume_session=resume_session)
     try:
-        trace_dir = _trace_dir(session)
-
         config = dict(kwargs.pop("config", None) or {})
-        caller_trace = config.get("propertyTrace", {})
-        if caller_trace is None:
-            caller_trace = {}
-        if not isinstance(caller_trace, Mapping):
-            raise TypeError("config.propertyTrace must be a mapping")
-        trace_config = {
-            **profile,
-            **dict(caller_trace),
-            "enabled": True,
-            "logDir": str(trace_dir),
-        }
-        config["propertyTrace"] = trace_config
+        if enable_trace:
+            trace_dir = _trace_dir(session)
+            caller_trace = config.get("propertyTrace", {})
+            if caller_trace is None:
+                caller_trace = {}
+            if not isinstance(caller_trace, Mapping):
+                raise TypeError("config.propertyTrace must be a mapping")
+            trace_config = {
+                **profile,
+                **dict(caller_trace),
+                "enabled": True,
+                "logDir": str(trace_dir),
+            }
+            config["propertyTrace"] = trace_config
+        else:
+            config.pop("propertyTrace", None)
 
         launch_kwargs = dict(kwargs)
         launch_kwargs["config"] = config

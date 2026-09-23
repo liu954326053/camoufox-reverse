@@ -41,6 +41,7 @@ class AsyncReverseBrowser:
         self.session: ReverseSession | None = None
         self.store: EvidenceStore | None = None
         self._cm = None
+        self._cm_entered = False
         self._closed = False
         self._request_tasks: set[asyncio.Task[Any]] = set()
         self._request_ids: dict[int, str] = {}
@@ -53,12 +54,14 @@ class AsyncReverseBrowser:
                 proxy=self.proxy,
                 browser_version=self.browser_version,
                 trace_profile=self.trace_profile,
+                enable_trace=self.enable_trace,
                 **self.launch_kwargs,
             )
             self.session = session
             self.store = EvidenceStore(session)
             self._cm = AsyncCamoufox(from_options=options)
             self.browser = await self._cm.__aenter__()
+            self._cm_entered = True
             self.context = (
                 self.browser.contexts[0]
                 if getattr(self.browser, "contexts", None)
@@ -68,6 +71,13 @@ class AsyncReverseBrowser:
             self._attach_page(self.page)
             return self
         except Exception as error:
+            if self._cm_entered and self._cm is not None:
+                try:
+                    await self._cm.__aexit__(type(error), error, error.__traceback__)
+                except Exception:
+                    pass
+                finally:
+                    self._cm_entered = False
             await self._mark_incomplete(error)
             raise
 
@@ -201,8 +211,11 @@ class AsyncReverseBrowser:
                     await self.snapshot()
                 except Exception:
                     pass
-            if self._cm is not None:
-                await self._cm.__aexit__(None, None, None)
+            if self._cm_entered and self._cm is not None:
+                try:
+                    await self._cm.__aexit__(None, None, None)
+                finally:
+                    self._cm_entered = False
             if self.store is not None:
                 if incomplete:
                     self.store.flush()

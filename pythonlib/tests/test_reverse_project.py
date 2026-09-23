@@ -95,6 +95,26 @@ def test_manifest_snapshot_reads_and_validates_a_copy_from_disk(tmp_path):
     assert session.manifest_snapshot()["status"] == "starting"
 
 
+def test_list_sessions_uses_public_manifest_snapshot(tmp_path):
+    project = ReverseProject.open(tmp_path / "analysis")
+    session = project.create_session()
+    session.close()
+    session._manifest["status"] = "running"
+
+    listed = project.list_sessions()
+
+    assert listed == [
+        {
+            "session_id": session.session_id,
+            "status": "complete",
+            "started_at": listed[0]["started_at"],
+            "ended_at": listed[0]["ended_at"],
+            "session_dir": str(session.path),
+            "manifest": str(session.manifest_path),
+        }
+    ]
+
+
 def test_mark_running_updates_manifest_through_public_lifecycle_api(tmp_path):
     session = ReverseProject.open(tmp_path / "analysis").create_session()
 

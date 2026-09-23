@@ -265,7 +265,7 @@ class ReverseProject:
             if not session_path.is_dir() or session_path.is_symlink():
                 raise ProjectError("Session directory is invalid")
             session = self.get_session(session_path.name)
-            manifest = session._manifest
+            manifest = session.manifest_snapshot()
             sessions.append(
                 {
                     "session_id": session.session_id,

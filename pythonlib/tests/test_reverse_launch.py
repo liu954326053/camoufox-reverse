@@ -1,11 +1,13 @@
 """Tests for project-scoped reverse browser launch options."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from camoufox import launch_options as ordinary_launch_options
 from camoufox import reverse_launch_options
+from camoufox.utils import validate_config
 
 
 def test_reverse_launch_requires_project_dir():
@@ -26,6 +28,31 @@ def test_reverse_launch_points_property_trace_inside_session(tmp_path, monkeypat
     assert options["config"]["propertyTrace"]["enabled"] is True
     assert session.trace_dir == session.path / "trace"
     assert session.trace_dir.is_dir()
+
+
+def test_property_trace_is_a_known_dict_config_without_stdout_warning(capsys):
+    properties_path = Path(__file__).parents[2] / "settings" / "properties.json"
+
+    validate_config({"propertyTrace": {"enabled": True}}, path=properties_path)
+
+    assert capsys.readouterr().out == ""
+
+
+def test_reverse_launch_no_trace_omits_property_trace_config(tmp_path, monkeypatch):
+    monkeypatch.setattr("camoufox.reverse_launch.launch_options", lambda **kwargs: kwargs)
+    caller_config = {
+        "navigator.userAgent": "caller-value",
+        "propertyTrace": {"enabled": True},
+    }
+
+    options, session = reverse_launch_options(
+        project_dir=tmp_path / "p",
+        config=caller_config,
+        enable_trace=False,
+    )
+
+    assert "propertyTrace" not in options["config"]
+    assert not session.trace_dir.exists()
 
 
 def test_reverse_launch_normalizes_proxy_and_browser_selector(tmp_path, monkeypatch):

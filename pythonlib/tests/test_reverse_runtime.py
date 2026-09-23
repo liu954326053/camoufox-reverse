@@ -74,13 +74,19 @@ class FakeBrowser:
 
 
 class FakeCamoufox:
+    instances = []
+
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.exited = False
+        type(self).instances.append(self)
 
     async def __aenter__(self):
-        return FakeBrowser()
+        self.browser = FakeBrowser()
+        return self.browser
 
     async def __aexit__(self, *args):
+        self.exited = True
         return None
 
 
@@ -109,6 +115,61 @@ async def test_runtime_owns_browser_and_finalizes_session(monkeypatch, tmp_path)
     assert result["session_id"] == session.session_id
     assert store.finalized is True
     assert store.files["raw/manual.bin"] == b"raw-value"
+
+
+@pytest.mark.asyncio
+async def test_runtime_passes_trace_switch_to_launch_options(monkeypatch, tmp_path):
+    session = FakeSession(tmp_path / "session")
+    captured = {}
+
+    def fake_reverse_launch_options(**kwargs):
+        captured.update(kwargs)
+        return {"env": {}}, session
+
+    monkeypatch.setattr(reverse_runtime, "reverse_launch_options", fake_reverse_launch_options)
+    monkeypatch.setattr(reverse_runtime, "EvidenceStore", lambda value: FakeStore(value))
+    monkeypatch.setattr(reverse_runtime, "AsyncCamoufox", FakeCamoufox)
+
+    runtime = reverse_runtime.AsyncReverseBrowser(
+        tmp_path / "project", enable_trace=False
+    )
+    await runtime.__aenter__()
+    await runtime.close()
+
+    assert captured["enable_trace"] is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_closes_entered_browser_when_context_setup_fails(
+    monkeypatch, tmp_path
+):
+    session = FakeSession(tmp_path / "session")
+
+    class FailingContext:
+        @property
+        def pages(self):
+            raise RuntimeError("page setup failed")
+
+    class FailingCamoufox(FakeCamoufox):
+        async def __aenter__(self):
+            self.browser = FakeBrowser()
+            self.browser.contexts = [FailingContext()]
+            return self.browser
+
+    monkeypatch.setattr(
+        reverse_runtime,
+        "reverse_launch_options",
+        lambda **kwargs: ({"env": {}}, session),
+    )
+    monkeypatch.setattr(reverse_runtime, "EvidenceStore", lambda value: FakeStore(value))
+    monkeypatch.setattr(reverse_runtime, "AsyncCamoufox", FailingCamoufox)
+
+    runtime = reverse_runtime.AsyncReverseBrowser(tmp_path / "project")
+    with pytest.raises(RuntimeError, match="page setup failed"):
+        await runtime.__aenter__()
+
+    assert FailingCamoufox.instances[-1].exited is True
+    assert session.closed == ["incomplete"]
 
 
 @pytest.mark.asyncio

@@ -159,6 +159,42 @@ def test_launch_holds_fake_runtime_and_emits_after_browser_enter(
     }
 
 
+def test_cli_no_trace_has_no_property_trace_in_launch_options(
+    runner, tmp_path, monkeypatch
+):
+    captured = {}
+
+    class OptionCapturingRuntime(FakeRuntime):
+        async def __aenter__(self):
+            from camoufox import reverse_launch
+
+            captured["options"], self.session = reverse_launch.reverse_launch_options(
+                project_dir=self.project_dir,
+                **self.kwargs,
+            )
+            self.entered = True
+            return self
+
+    monkeypatch.setattr("camoufox.reverse_cli._runtime_factory", lambda: OptionCapturingRuntime)
+    monkeypatch.setattr("camoufox.reverse_launch.launch_options", lambda **kwargs: kwargs)
+
+    result = runner.invoke(
+        cli,
+        [
+            "launch",
+            "--project-dir",
+            str(tmp_path / "p"),
+            "--headless",
+            "--no-trace",
+            "--duration",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "propertyTrace" not in captured["options"]["config"]
+
+
 def test_launch_navigates_url_before_duration_exit(runner, tmp_path):
     result = runner.invoke(
         cli,

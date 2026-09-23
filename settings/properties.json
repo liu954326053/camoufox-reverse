@@ -101,6 +101,7 @@
   { "property": "disableWorldIsolation", "type": "bool" },
   { "property": "allowAddonNewtab", "type": "bool" },
   { "property": "forceScopeAccess", "type": "bool" },
+  { "property": "propertyTrace", "type": "dict" },
 
   { "property": "disableTheming", "type": "bool" },
   { "property": "disableInstantAnimations", "type": "bool" },
