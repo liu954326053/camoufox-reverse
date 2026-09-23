@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import stat
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from typing import Any, Union
 
 
 PathLike = Union[str, os.PathLike[str]]
+_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
 class ProjectError(RuntimeError):
@@ -50,6 +53,20 @@ def _secure_directory(path: Path) -> None:
         raise ProjectError(f"Cannot secure directory: {path}") from exc
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort durability for the directory entry installed by replace."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
 def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     payload = json.dumps(manifest, indent=2, sort_keys=False) + "\n"
@@ -69,6 +86,7 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
             if descriptor != -1:
                 os.close(descriptor)
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     except OSError as exc:
         try:
             temporary.unlink()
@@ -122,11 +140,13 @@ class ReverseProject:
         _secure_directory(resolved)
 
         for child in (resolved / "runs", resolved / "indexes"):
+            if child.is_symlink():
+                raise ProjectError(f"Project directory cannot be a symlink: {child}")
             try:
                 child.mkdir(mode=0o700, exist_ok=True)
             except OSError as exc:
                 raise ProjectError(f"Cannot create project directory: {child}") from exc
-            if not child.is_dir():
+            if not child.is_dir() or child.resolve(strict=True).parent != resolved:
                 raise ProjectError(f"Project path is not a directory: {child}")
             _secure_directory(child)
 
@@ -145,35 +165,66 @@ class ReverseProject:
                 continue
             except OSError as exc:
                 raise ProjectError("Cannot create session directory") from exc
-            raw_dir = session_path / "raw"
             try:
+                if session_path.is_symlink() or session_path.resolve(strict=True).parent != self.runs_dir:
+                    raise ProjectError("Session directory is outside the project")
+                raw_dir = session_path / "raw"
                 raw_dir.mkdir(mode=0o700)
+                if raw_dir.is_symlink() or raw_dir.resolve(strict=True).parent != session_path:
+                    raise ProjectError("Session raw directory is outside the session")
+                session = ReverseSession._new(self, session_id, session_path, raw_dir)
+                _write_manifest(session.manifest_path, session._manifest)
+                return session
             except OSError as exc:
+                shutil.rmtree(session_path, ignore_errors=True)
                 raise ProjectError("Cannot create session raw directory") from exc
-            session = ReverseSession._new(self, session_id, session_path, raw_dir)
-            _write_manifest(session.manifest_path, session._manifest)
-            return session
+            except Exception:
+                shutil.rmtree(session_path, ignore_errors=True)
+                raise
         raise ProjectError("Cannot allocate a unique session id")
 
     def _resume_session(self, session_id: str) -> "ReverseSession":
-        if not isinstance(session_id, str) or not session_id or Path(session_id).name != session_id:
+        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
             raise ProjectError("Invalid session id")
+        if self.runs_dir.is_symlink() or not self.runs_dir.is_dir():
+            raise ProjectError("Project runs directory is invalid")
         session_path = self.runs_dir / session_id
+        if session_path.is_symlink() or not session_path.is_dir():
+            raise ProjectError("Session directory is invalid")
+        if session_path.resolve(strict=True).parent != self.runs_dir.resolve(strict=True):
+            raise ProjectError("Session directory is outside the project")
         manifest_path = session_path / "manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ProjectError("Cannot read session manifest") from exc
+        manifest = self._read_manifest(manifest_path, session_id)
         if manifest.get("status") != "incomplete":
             raise ProjectError("Only incomplete sessions can be resumed")
         raw_dir = session_path / "raw"
-        if not session_path.is_dir() or not raw_dir.is_dir():
+        if (
+            raw_dir.is_symlink()
+            or not raw_dir.is_dir()
+            or raw_dir.resolve(strict=True).parent != session_path.resolve(strict=True)
+        ):
             raise ProjectError("Session evidence directory is incomplete")
 
         manifest["status"] = "starting"
         manifest["ended_at"] = None
         _write_manifest(manifest_path, manifest)
         return ReverseSession(self, session_id, session_path, raw_dir, manifest)
+
+    @staticmethod
+    def _read_manifest(path: Path, session_id: str) -> dict[str, Any]:
+        if path.is_symlink():
+            raise ProjectError("Session manifest cannot be a symlink")
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProjectError("Cannot read session manifest") from exc
+        if (
+            not isinstance(manifest, dict)
+            or manifest.get("schema") != 1
+            or manifest.get("session_id") != session_id
+        ):
+            raise ProjectError("Session manifest identity is invalid")
+        return manifest
 
 
 class ReverseSession:
@@ -215,11 +266,13 @@ class ReverseSession:
     def close(self, status: str = "complete") -> None:
         if status not in {"complete", "incomplete"}:
             raise ProjectError("Invalid session final status")
-        if self._manifest.get("status") == "complete":
+        manifest = self.project._read_manifest(self.manifest_path, self.session_id)
+        if manifest.get("status") == "complete":
             raise ProjectError("Complete sessions are immutable")
-        self._manifest["status"] = status
-        self._manifest["ended_at"] = _timestamp()
-        _write_manifest(self.manifest_path, self._manifest)
+        manifest["status"] = status
+        manifest["ended_at"] = _timestamp()
+        _write_manifest(self.manifest_path, manifest)
+        self._manifest = manifest
 
     def mark_incomplete(self, error: BaseException | None = None) -> None:
         del error
