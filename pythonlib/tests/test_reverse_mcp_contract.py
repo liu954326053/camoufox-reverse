@@ -109,6 +109,17 @@ def _assert_paths_contained(value, *, session_dir, key=""):
         _assert_contained(value, session_dir=session_dir)
 
 
+def _assert_raw_capture_profiles(value):
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            if child_key == "capture_profile":
+                assert child_value == "raw"
+            _assert_raw_capture_profiles(child_value)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_raw_capture_profiles(item)
+
+
 def validate_project_dir(request):
     """Validate launch input before any session is created."""
     assert "project_dir" in request
@@ -158,12 +169,15 @@ def validate_response(response, *, session_dir, required_fields=REQUIRED_TOP_LEV
     assert actual_session_dir == actual_session_dir.resolve(strict=False)
     assert actual_session_dir == expected_session_dir
     assert "error" not in response
+    _assert_raw_capture_profiles(response)
     _assert_paths_contained(response, session_dir=expected_session_dir)
 
 
 def validate_error_response(response):
     assert response == {"status": "error", "error": response["error"]}
+    assert isinstance(response["error"]["code"], str)
     assert response["error"]["code"]
+    assert isinstance(response["error"]["message"], str)
     assert response["error"]["message"]
     assert "artifacts" not in response
     assert "session_dir" not in response
@@ -193,6 +207,21 @@ def test_raw_capture_response_exposes_profile_status_and_artifact():
     assert RAW_CAPTURE_RESPONSE["capture_profile"] == "raw"
     assert RAW_CAPTURE_RESPONSE["status"] == "started"
     assert RAW_CAPTURE_RESPONSE["artifacts"]["capture"].endswith("raw.jsonl")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {**RAW_CAPTURE_RESPONSE, "capture_profile": "metadata_only"},
+        {
+            **RAW_CAPTURE_RESPONSE,
+            "trace": {"capture_profile": "metadata_only"},
+        },
+    ],
+)
+def test_response_rejects_any_non_raw_capture_profile(response):
+    with pytest.raises(AssertionError):
+        validate_response(response, session_dir=SESSION_DIR)
 
 
 def test_trace_response_checks_nested_artifact_paths():
@@ -295,6 +324,24 @@ def test_error_envelope_is_valid_and_has_no_artifacts():
     validate_error_response(ERROR_RESPONSE)
     with pytest.raises(AssertionError):
         validate_error_response({**ERROR_RESPONSE, "artifacts": {}})
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("code", ""),
+        ("code", 400),
+        ("message", ""),
+        ("message", {"detail": "invalid"}),
+    ],
+)
+def test_error_envelope_rejects_empty_or_non_string_code_and_message(field, value):
+    response = {
+        "status": "error",
+        "error": {**ERROR_RESPONSE["error"], field: value},
+    }
+    with pytest.raises(AssertionError):
+        validate_error_response(response)
 
 
 def test_close_and_second_close_have_explicit_statuses():
