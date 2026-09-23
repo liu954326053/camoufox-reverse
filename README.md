@@ -105,6 +105,37 @@ installation must migrate.
 
 ---
 
+### Local reverse-browser smoke check
+
+The foundation can be checked locally without navigating a target site. Install
+the `reverse-browser` entry point, keep the local proxy available, and launch a
+short targeted session:
+
+```bash
+reverse-browser launch \
+  --project-dir /absolute/path/to/project \
+  --proxy http://127.0.0.1:7890 \
+  --browser-version whitenightshadow/152.0.4-beta.30-reverse.5 \
+  --trace-profile targeted
+```
+
+The command prints the project-scoped `session_id`, manifest, session directory,
+and trace directory. Acceptance should inspect
+`runs/<session_id>/manifest.json`, confirm raw trace files are present under the
+session, run the index rebuild, and verify that a forced initialization failure
+leaves an `incomplete` session that can be resumed. The browser-free regression
+suite is:
+
+```bash
+cd pythonlib
+python -m pytest tests/test_reverse_integration.py -q
+```
+
+This smoke check validates local launch, storage, containment, and recovery
+boundaries. It does not claim Google navigation or Google end-to-end success.
+
+---
+
 # Sponsors
 
 <details open>
