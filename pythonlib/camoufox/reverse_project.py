@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import shutil
 import stat
 import threading
 import uuid
+import weakref
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -351,6 +353,8 @@ class ReverseSession:
         self.trace_dir = path / "trace"
         self.manifest_path = path / "manifest.json"
         self._manifest = manifest
+        self._evidence_attached = False
+        self._evidence_store_ref = None
 
     @classmethod
     def _new(
@@ -370,17 +374,39 @@ class ReverseSession:
         }
         return cls(project, session_id, path, raw_dir, manifest)
 
+    def _attach_evidence_store(self, store: Any) -> None:
+        self._evidence_attached = True
+        self._evidence_store_ref = weakref.ref(store)
+
+    def _close_manifest_locked(self, status: str) -> None:
+        manifest = self.project._read_manifest(self.manifest_path, self.session_id)
+        if manifest.get("status") == "complete":
+            raise ProjectError("Complete sessions are immutable")
+        manifest["status"] = status
+        manifest["ended_at"] = _timestamp()
+        _write_manifest(self.manifest_path, manifest)
+        self._manifest = manifest
+
+    def _close_manifest(self, status: str) -> None:
+        with _session_lock(self.path):
+            self._close_manifest_locked(status)
+
+    def _close_from_evidence(self, status: str) -> None:
+        """Finalize the lifecycle after EvidenceStore made its durable snapshot."""
+        if status not in {"complete", "incomplete"}:
+            raise ProjectError("Invalid session final status")
+        self._close_manifest_locked(status)
+
     def close(self, status: str = "complete") -> None:
         if status not in {"complete", "incomplete"}:
             raise ProjectError("Invalid session final status")
-        with _session_lock(self.path):
-            manifest = self.project._read_manifest(self.manifest_path, self.session_id)
-            if manifest.get("status") == "complete":
-                raise ProjectError("Complete sessions are immutable")
-            manifest["status"] = status
-            manifest["ended_at"] = _timestamp()
-            _write_manifest(self.manifest_path, manifest)
-            self._manifest = manifest
+        if self._evidence_attached:
+            store = self._evidence_store_ref() if self._evidence_store_ref else None
+            if store is None:
+                raise ProjectError("EvidenceStore is unavailable for session finalization")
+            store.finalize(status=status)
+            return
+        self._close_manifest(status)
 
     def mark_running(
         self,
@@ -404,6 +430,10 @@ class ReverseSession:
                 manifest["proxy"] = proxy
             _write_manifest(self.manifest_path, manifest)
             self._manifest = manifest
+
+    def manifest_snapshot(self) -> dict[str, Any]:
+        """Return a validated copy of the current on-disk session manifest."""
+        return deepcopy(self.project._read_manifest(self.manifest_path, self.session_id))
 
     def mark_incomplete(self, error: BaseException | None = None) -> None:
         del error

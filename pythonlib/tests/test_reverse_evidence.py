@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import threading
 
 import pytest
 
@@ -277,6 +278,197 @@ def test_finalize_builds_index_before_marking_session_complete(tmp_path):
 
     assert index_path.exists()
     assert json.loads(session.manifest_path.read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_direct_session_close_builds_durable_index(tmp_path):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/response.bin", b"direct-close")
+
+    session.close()
+
+    index_path = session.project.indexes_dir / f"{session.session_id}.json"
+    assert index_path.exists()
+    assert json.loads(index_path.read_text(encoding="utf-8"))["files"] == {
+        "raw/response.bin": {
+            "bytes": len(b"direct-close"),
+            "event_count": 0,
+            "sha256": hashlib.sha256(b"direct-close").hexdigest(),
+        }
+    }
+
+
+def test_finalize_holds_session_lock_for_append_snapshot(tmp_path, monkeypatch):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/before.bin", b"before")
+    file_info_started = threading.Event()
+    release_file_info = threading.Event()
+    append_finished = threading.Event()
+    append_errors = []
+    original_file_snapshot = store._file_snapshot
+
+    def delayed_file_snapshot(relative, parts):
+        file_info_started.set()
+        assert release_file_info.wait(2)
+        return original_file_snapshot(relative, parts)
+
+    monkeypatch.setattr(store, "_file_snapshot", delayed_file_snapshot)
+    finalize_errors = []
+
+    def finalize():
+        try:
+            store.finalize()
+        except Exception as exc:  # pragma: no cover - assertion below reports it
+            finalize_errors.append(exc)
+
+    finalize_thread = threading.Thread(target=finalize)
+    finalize_thread.start()
+    assert file_info_started.wait(2)
+
+    def append_late():
+        try:
+            store.append_bytes("raw/after.bin", b"after")
+        except EvidenceError as exc:
+            append_errors.append(exc)
+        finally:
+            append_finished.set()
+
+    append_thread = threading.Thread(target=append_late)
+    append_thread.start()
+    assert not append_finished.wait(0.2)
+
+    release_file_info.set()
+    finalize_thread.join(2)
+    append_thread.join(2)
+
+    assert not finalize_errors
+    assert not finalize_thread.is_alive()
+    assert not append_thread.is_alive()
+    index = json.loads(
+        (session.project.indexes_dir / f"{session.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sorted(index["files"]) == ["raw/before.bin"]
+    assert len(append_errors) == 1
+    assert not (session.path / "raw/after.bin").exists()
+
+
+def test_index_symlink_replacement_fails_without_outside_write(tmp_path):
+    session, store = _store(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    indexes = session.project.indexes_dir
+    indexes.rmdir()
+    indexes.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(EvidenceError):
+        store.rebuild_index()
+
+    assert not (outside / f"{session.session_id}.json").exists()
+
+
+def test_direct_session_close_delegates_to_evidence_finalization(tmp_path):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/response.bin", b"complete")
+
+    session.close()
+
+    index_path = session.project.indexes_dir / f"{session.session_id}.json"
+    assert index_path.exists()
+    assert json.loads(session.manifest_path.read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_finalize_holds_evidence_lock_through_index_and_close(tmp_path, monkeypatch):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/before.bin", b"before")
+    replace_started = threading.Event()
+    release_replace = threading.Event()
+    append_finished = threading.Event()
+    append_errors = []
+    original_rename = reverse_evidence.os.rename
+
+    def delayed_rename(source, destination, *args, **kwargs):
+        if destination == f"{session.session_id}.json" and kwargs.get("dst_dir_fd") is not None:
+            replace_started.set()
+            assert release_replace.wait(2)
+        return original_rename(source, destination, *args, **kwargs)
+
+    def append_after_snapshot():
+        try:
+            store.append_bytes("raw/after.bin", b"after")
+        except EvidenceError as exc:
+            append_errors.append(exc)
+        finally:
+            append_finished.set()
+
+    monkeypatch.setattr(reverse_evidence.os, "rename", delayed_rename)
+    finalization = threading.Thread(target=store.finalize)
+    finalization.start()
+    assert replace_started.wait(2)
+
+    writer = threading.Thread(target=append_after_snapshot)
+    writer.start()
+    assert not append_finished.wait(0.2)
+    release_replace.set()
+    finalization.join(2)
+    writer.join(2)
+
+    assert not finalization.is_alive()
+    assert not writer.is_alive()
+    assert len(append_errors) == 1
+    assert json.loads(session.manifest_path.read_text(encoding="utf-8"))["status"] == "complete"
+    index = json.loads(
+        (session.project.indexes_dir / f"{session.session_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [item["path"] for item in index["artifacts"]] == ["raw/before.bin"]
+    assert not (session.path / "raw/after.bin").exists()
+
+
+def test_index_directory_symlink_replacement_is_rejected_without_escape(tmp_path):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/response.bin", b"raw")
+    outside = tmp_path / "outside-indexes"
+    outside.mkdir()
+    indexes = session.project.indexes_dir
+    indexes.rename(tmp_path / "original-indexes")
+    indexes.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(EvidenceError):
+        store.rebuild_index()
+
+    assert not (outside / f"{session.session_id}.json").exists()
+
+
+def test_register_artifact_rejects_path_replacement_after_fd_digest(tmp_path, monkeypatch):
+    session, store = _store(tmp_path)
+    path = session.path / "raw/response.bin"
+    store.append_bytes("raw/response.bin", b"before")
+    original_digest = store._digest_fd
+    replaced = False
+
+    def digest_then_replace(descriptor):
+        nonlocal replaced
+        result = original_digest(descriptor)
+        if not replaced:
+            replaced = True
+            replacement = path.with_name("replacement.bin")
+            replacement.write_bytes(b"after")
+            replacement.replace(path)
+        return result
+
+    monkeypatch.setattr(store, "_digest_fd", digest_then_replace)
+
+    with pytest.raises(EvidenceError):
+        store.register_artifact(
+            "raw/response.bin",
+            hashlib.sha256(b"before").hexdigest(),
+            len(b"before"),
+            "response",
+        )
+
+    assert not (session.path / "raw/artifacts.jsonl").exists()
 
 
 def test_index_sorting_is_independent_of_raw_file_creation_order(tmp_path):

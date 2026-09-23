@@ -43,50 +43,65 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-@contextmanager
-def _locked(descriptor: int) -> Iterator[None]:
-    if fcntl is not None:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-    try:
-        yield
-    finally:
-        if fcntl is not None:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-
-
 class EvidenceStore:
     """Append-only raw evidence and a rebuildable deterministic session index."""
 
     def __init__(self, session: ReverseSession):
         if not isinstance(session, ReverseSession):
             raise TypeError("session must be a ReverseSession")
-        if fcntl is None or os.open not in getattr(os, "supports_dir_fd", set()):
+        if (
+            fcntl is None
+            or os.open not in getattr(os, "supports_dir_fd", set())
+            or os.rename not in getattr(os, "supports_dir_fd", set())
+        ):
             raise EvidenceError("Secure evidence storage requires POSIX dirfd support")
+        self._root_fd = None
+        self._project_fd = None
+        self._indexes_fd = None
         self.session = session
         self.root = session.path.resolve(strict=True)
         self.raw_dir = session.raw_dir.resolve(strict=True)
+        self.project_root = session.project.path.resolve(strict=True)
         if self.raw_dir.parent != self.root or not self.raw_dir.is_dir():
             raise EvidenceError("Session raw directory is invalid")
         try:
             self._root_fd = os.open(self.root, _DIR_FLAGS)
+            self._project_fd = os.open(self.project_root, _DIR_FLAGS)
+            self._indexes_fd = self._open_directory(self._project_fd, "indexes", create=False)
         except OSError as exc:
+            self._close_descriptors()
             raise EvidenceError("Cannot open session root securely") from exc
-        self._lock_path = self.root / ".evidence.lock"
+        self._indexes_identity = self._identity(os.fstat(self._indexes_fd))
+        session._attach_evidence_store(self)
+
+    def _close_descriptors(self) -> None:
+        for name in ("_indexes_fd", "_project_fd", "_root_fd"):
+            descriptor = getattr(self, name, None)
+            if descriptor is not None:
+                setattr(self, name, None)
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def __del__(self):
-        descriptor = getattr(self, "_root_fd", None)
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            self._root_fd = None
+        try:
+            self._close_descriptors()
+        except Exception:
+            pass
+
+    @contextmanager
+    def _evidence_lock(self) -> Iterator[None]:
+        """Serialize every evidence mutation and index snapshot for this session."""
+        try:
+            with reverse_project._session_lock(self.root):
+                yield
+        except reverse_project.ProjectError as exc:
+            raise EvidenceError("Cannot acquire evidence session lock") from exc
 
     def _manifest(self) -> dict[str, Any]:
         try:
-            return reverse_project.ReverseProject._read_manifest(
-                self.session.manifest_path, self.session.session_id
-            )
+            return self.session.manifest_snapshot()
         except reverse_project.ProjectError as exc:
             raise EvidenceError("Cannot read session manifest") from exc
 
@@ -164,6 +179,27 @@ class EvidenceStore:
             except OSError as exc:
                 raise EvidenceError(f"Cannot open evidence file: {'/'.join(parts)}") from exc
 
+    @contextmanager
+    def _opened_relative(
+        self,
+        parts: tuple[str, ...],
+        flags: int,
+        mode: int = 0o600,
+        *,
+        create_parents: bool = False,
+    ) -> Iterator[tuple[int, int]]:
+        with self._parent_fd(parts, create_parents) as parent_fd:
+            try:
+                descriptor = os.open(
+                    parts[-1], flags | _NOFOLLOW, mode, dir_fd=parent_fd
+                )
+            except OSError as exc:
+                raise EvidenceError(f"Cannot open evidence file: {'/'.join(parts)}") from exc
+            try:
+                yield descriptor, parent_fd
+            finally:
+                os.close(descriptor)
+
     @staticmethod
     def _write_all(descriptor: int, data: bytes) -> None:
         offset = 0
@@ -176,8 +212,7 @@ class EvidenceStore:
                 raise EvidenceError("Evidence write made no progress")
             offset += written
 
-    def _append(self, relative_path: PathLike, data: bytes) -> str:
-        self._ensure_open()
+    def _append_unlocked(self, relative_path: PathLike, data: bytes) -> str:
         normalized, parts = self._parts(relative_path)
         descriptor = self._open_relative(
             parts,
@@ -187,15 +222,19 @@ class EvidenceStore:
         assert descriptor is not None
         try:
             os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
-            with _locked(descriptor):
-                self._write_all(descriptor, data)
-                try:
-                    os.fsync(descriptor)
-                except OSError as exc:
-                    raise EvidenceError("Cannot fsync evidence file") from exc
+            self._write_all(descriptor, data)
+            try:
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise EvidenceError("Cannot fsync evidence file") from exc
         finally:
             os.close(descriptor)
         return normalized
+
+    def _append(self, relative_path: PathLike, data: bytes) -> str:
+        with self._evidence_lock():
+            self._ensure_open()
+            return self._append_unlocked(relative_path, data)
 
     def append_jsonl(self, relative_path: PathLike, event: Mapping[str, Any]) -> str:
         """Append one complete JSON object without lossy Unicode conversion."""
@@ -215,14 +254,6 @@ class EvidenceStore:
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise EvidenceError("Evidence data must be bytes-like")
         return self._append(relative_path, bytes(data))
-
-    def _open_lock(self) -> int:
-        descriptor = self._open_relative(
-            (".evidence.lock",), os.O_RDWR | os.O_CREAT
-        )
-        assert descriptor is not None
-        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
-        return descriptor
 
     def _open_existing(self, parts: tuple[str, ...]) -> int | None:
         return self._open_relative(parts, os.O_RDONLY, allow_missing=True)
@@ -257,6 +288,47 @@ class EvidenceStore:
         return size, digest.hexdigest()
 
     @staticmethod
+    def _identity(file_stat: os.stat_result) -> tuple[int, int]:
+        return file_stat.st_dev, file_stat.st_ino
+
+    @classmethod
+    def _same_file_observation(
+        cls, first: os.stat_result, second: os.stat_result
+    ) -> bool:
+        return (
+            cls._identity(first) == cls._identity(second)
+            and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
+            and first.st_size == second.st_size
+            and first.st_mtime_ns == second.st_mtime_ns
+            and first.st_ctime_ns == second.st_ctime_ns
+        )
+
+    @staticmethod
+    def _parse_events(payload: bytes) -> tuple[int, int, list[int]]:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return 0, 1, []
+        count = malformed = 0
+        sequences: list[int] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            if not isinstance(value, dict):
+                malformed += 1
+                continue
+            count += 1
+            sequence = value.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                sequences.append(sequence)
+        return count, malformed, sequences
+
+    @staticmethod
     def _registration(path: str, sha256: str, size: int, kind: str) -> dict[str, Any]:
         if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
             raise EvidenceError("sha256 must be a lowercase hexadecimal digest")
@@ -270,48 +342,43 @@ class EvidenceStore:
         self, relative_path: PathLike, sha256: str, size: int, kind: str
     ) -> dict[str, Any]:
         """Register metadata after validating the current regular file contents."""
-        self._ensure_open()
         normalized, parts = self._parts(relative_path)
         record = self._registration(normalized, sha256, size, kind)
-        lock = self._open_lock()
-        try:
-            with _locked(lock):
-                manifest = self._manifest()
-                if manifest.get("status") == "complete":
-                    raise EvidenceError("Complete sessions are immutable")
-                descriptor = self._open_existing(parts)
-                if descriptor is None:
-                    raise EvidenceError("Registered artifact does not exist")
+        with self._evidence_lock():
+            self._ensure_open()
+            manifest = self._manifest()
+            if manifest.get("status") == "complete":
+                raise EvidenceError("Complete sessions are immutable")
+            with self._opened_relative(parts, os.O_RDONLY) as (descriptor, parent_fd):
+                before_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                before_fd = os.fstat(descriptor)
+                if not stat.S_ISREG(before_fd.st_mode) or not stat.S_ISREG(before_path.st_mode):
+                    raise EvidenceError("Registered artifact must be a regular file")
+                if not self._same_file_observation(before_fd, before_path):
+                    raise EvidenceError("Registered artifact was replaced during validation")
+                actual_size, actual_hash = self._digest_fd(descriptor)
+                after_fd = os.fstat(descriptor)
+                after_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                if not self._same_file_observation(before_fd, after_fd) or not self._same_file_observation(
+                    before_fd, after_path
+                ):
+                    raise EvidenceError("Registered artifact was replaced during validation")
+                if actual_size != size or actual_hash != sha256:
+                    raise EvidenceError(
+                        "Registered artifact metadata does not match file contents"
+                    )
+                payload = json.dumps(
+                    record, ensure_ascii=False, separators=(",", ":")
+                ).encode("utf-8") + b"\n"
+                self._append_unlocked(_REGISTRY_PATH, payload)
+                artifacts = manifest.setdefault("artifacts", [])
+                if not isinstance(artifacts, list):
+                    raise EvidenceError("Session artifact registry is invalid")
+                artifacts.append(record)
                 try:
-                    file_stat = os.fstat(descriptor)
-                    if not stat.S_ISREG(file_stat.st_mode):
-                        raise EvidenceError("Registered artifact must be a regular file")
-                    with _locked(descriptor):
-                        actual_size, actual_hash = self._digest_fd(descriptor)
-                        if actual_size != size or actual_hash != sha256:
-                            raise EvidenceError(
-                                "Registered artifact metadata does not match file contents"
-                            )
-                        payload = json.dumps(
-                            record, ensure_ascii=False, separators=(",", ":")
-                        ).encode("utf-8") + b"\n"
-                        self._append(_REGISTRY_PATH, payload)
-                        artifacts = manifest.setdefault("artifacts", [])
-                        if not isinstance(artifacts, list):
-                            raise EvidenceError("Session artifact registry is invalid")
-                        artifacts.append(record)
-                        try:
-                            reverse_project._write_manifest(
-                                self.session.manifest_path, manifest
-                            )
-                        except Exception as exc:
-                            raise EvidenceError(
-                                "Registry durable; manifest reconciliation required"
-                            ) from exc
-                finally:
-                    os.close(descriptor)
-        finally:
-            os.close(lock)
+                    reverse_project._write_manifest(self.session.manifest_path, manifest)
+                except Exception as exc:
+                    raise EvidenceError("Registry durable; manifest reconciliation required") from exc
         return record
 
     def _read_registry(self) -> list[dict[str, Any]]:
@@ -347,56 +414,88 @@ class EvidenceStore:
             files.append((relative, tuple(relative.split("/"))))
         return files
 
-    def _file_info(self, parts: tuple[str, ...]) -> tuple[int, str]:
-        descriptor = self._open_existing(parts)
-        if descriptor is None:
-            raise EvidenceError("Raw evidence file disappeared during indexing")
-        try:
-            file_stat = os.fstat(descriptor)
-            if not stat.S_ISREG(file_stat.st_mode):
+    def _file_snapshot(
+        self, relative: str, parts: tuple[str, ...]
+    ) -> tuple[int, str, int, int, list[int]]:
+        with self._opened_relative(parts, os.O_RDONLY) as (descriptor, parent_fd):
+            before_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            before_fd = os.fstat(descriptor)
+            if not stat.S_ISREG(before_fd.st_mode) or not stat.S_ISREG(before_path.st_mode):
                 raise EvidenceError("Raw evidence path is not a regular file")
-            return self._digest_fd(descriptor)
-        finally:
-            os.close(descriptor)
+            if not self._same_file_observation(before_fd, before_path):
+                raise EvidenceError(f"Raw evidence path was replaced: {relative}")
+            if relative.endswith(".jsonl"):
+                payload = self._read_fd(descriptor)
+                byte_count = len(payload)
+                content_hash = hashlib.sha256(payload).hexdigest()
+                event_count, malformed, sequences = self._parse_events(payload)
+            else:
+                byte_count, content_hash = self._digest_fd(descriptor)
+                event_count, malformed, sequences = 0, 0, []
+            after_fd = os.fstat(descriptor)
+            after_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+            if not self._same_file_observation(before_fd, after_fd) or not self._same_file_observation(
+                before_fd, after_path
+            ):
+                raise EvidenceError(f"Raw evidence path was replaced: {relative}")
+            return byte_count, content_hash, event_count, malformed, sequences
 
-    def _event_info(self, parts: tuple[str, ...]) -> tuple[int, int, list[int]]:
-        if not parts[-1].endswith(".jsonl"):
-            return 0, 0, []
-        descriptor = self._open_existing(parts)
-        if descriptor is None:
-            raise EvidenceError("JSONL evidence file disappeared during indexing")
+    def _validate_indexes_directory(self) -> None:
         try:
-            payload = self._read_fd(descriptor)
-        finally:
+            current = os.lstat(self.session.project.indexes_dir)
+        except OSError as exc:
+            raise EvidenceError("Session index directory is unavailable") from exc
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+            raise EvidenceError("Session index directory cannot be a symlink")
+        if self._identity(current) != self._indexes_identity:
+            raise EvidenceError("Session index directory was replaced")
+
+    def _write_index(self, index: dict[str, Any]) -> Path:
+        self._validate_indexes_directory()
+        name = f"{self.session.session_id}.json"
+        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+        payload = json.dumps(index, ensure_ascii=False, indent=2, sort_keys=False).encode(
+            "utf-8"
+        ) + b"\n"
+        descriptor = None
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                0o600,
+                dir_fd=self._indexes_fd,
+            )
+            os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+            self._write_all(descriptor, payload)
+            os.fsync(descriptor)
             os.close(descriptor)
-        try:
-            text = payload.decode("utf-8")
-        except UnicodeDecodeError:
-            return 0, 1, []
-        count = malformed = 0
-        sequences: list[int] = []
-        for line in text.splitlines():
-            if not line.strip():
-                continue
+            descriptor = None
+            self._validate_indexes_directory()
+            os.rename(
+                temporary,
+                name,
+                src_dir_fd=self._indexes_fd,
+                dst_dir_fd=self._indexes_fd,
+            )
+            os.fsync(self._indexes_fd)
+            self._validate_indexes_directory()
+        except OSError as exc:
+            raise EvidenceError("Cannot write deterministic session index") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                malformed += 1
-                continue
-            if not isinstance(value, dict):
-                malformed += 1
-                continue
-            count += 1
-            sequence = value.get("sequence")
-            if isinstance(sequence, int) and not isinstance(sequence, bool):
-                sequences.append(sequence)
-        return count, malformed, sequences
+                os.unlink(temporary, dir_fd=self._indexes_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        return self.session.project.indexes_dir / name
 
-    def rebuild_index(self) -> Path:
-        """Rebuild an incomplete-session index and reconcile its manifest."""
+    def _rebuild_index_unlocked(self) -> Path:
+        """Build one lock-consistent snapshot and reconcile its manifest."""
+        self._ensure_open()
         manifest = self._manifest()
-        if manifest.get("status") == "complete":
-            raise EvidenceError("Complete sessions are immutable")
         records = self._read_registry()
         if manifest.get("artifacts") != records:
             manifest["artifacts"] = records
@@ -412,8 +511,9 @@ class EvidenceStore:
         artifacts: list[dict[str, Any]] = []
         malformed_total = 0
         for relative, parts in self._raw_files():
-            byte_count, content_hash = self._file_info(parts)
-            event_count, malformed, sequences = self._event_info(parts)
+            byte_count, content_hash, event_count, malformed, sequences = self._file_snapshot(
+                relative, parts
+            )
             malformed_total += malformed
             files[relative] = {
                 "bytes": byte_count,
@@ -429,6 +529,10 @@ class EvidenceStore:
                 }
             ]
             for entry in entries:
+                if entry.get("size") != byte_count or entry.get("sha256") != content_hash:
+                    raise EvidenceError(
+                        f"Registered artifact metadata no longer matches: {relative}"
+                    )
                 item = dict(entry)
                 item.update(
                     {
@@ -442,17 +546,7 @@ class EvidenceStore:
         for relative, entries in registered.items():
             if relative in files:
                 continue
-            for entry in entries:
-                item = dict(entry)
-                item.update(
-                    {
-                        "bytes": 0,
-                        "event_count": 0,
-                        "content_sha256": None,
-                        "event_sequence": None,
-                    }
-                )
-                artifacts.append(item)
+            raise EvidenceError(f"Registered artifact disappeared: {relative}")
         artifacts.sort(
             key=lambda item: (
                 item.get("path", ""),
@@ -474,31 +568,13 @@ class EvidenceStore:
             "artifacts": artifacts,
             "files": {key: files[key] for key in sorted(files)},
         }
-        index_path = self.session.project.indexes_dir / f"{self.session.session_id}.json"
-        temporary = index_path.with_name(f".{index_path.name}.{uuid.uuid4().hex}.tmp")
-        payload = json.dumps(index, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
-        try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    descriptor = -1
-                    stream.write(payload)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            finally:
-                if descriptor != -1:
-                    os.close(descriptor)
-            os.replace(temporary, index_path)
-            _fsync_directory(index_path.parent)
-        except OSError as exc:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-            raise EvidenceError("Cannot write deterministic session index") from exc
-        return index_path
+        return self._write_index(index)
 
-    def flush(self) -> None:
+    def rebuild_index(self) -> Path:
+        with self._evidence_lock():
+            return self._rebuild_index_unlocked()
+
+    def _flush_unlocked(self) -> None:
         """Fsync raw files and registry before session shutdown."""
         self._ensure_open()
         paths = [parts for _, parts in self._raw_files()]
@@ -516,15 +592,20 @@ class EvidenceStore:
         _fsync_directory(self.raw_dir)
         _fsync_directory(self.root)
 
+    def flush(self) -> None:
+        with self._evidence_lock():
+            self._flush_unlocked()
+
     def finalize(self, status: str = "complete") -> Path:
         """Flush, build the index, then finalize the associated session."""
-        self.flush()
-        index_path = self.rebuild_index()
-        try:
-            self.session.close(status=status)
-        except reverse_project.ProjectError as exc:
-            raise EvidenceError("Cannot finalize evidence session") from exc
-        return index_path
+        with self._evidence_lock():
+            self._flush_unlocked()
+            index_path = self._rebuild_index_unlocked()
+            try:
+                self.session._close_from_evidence(status)
+            except reverse_project.ProjectError as exc:
+                raise EvidenceError("Cannot finalize evidence session") from exc
+            return index_path
 
     def close(self, status: str = "complete") -> Path:
         """Compatibility alias for :meth:`finalize`."""

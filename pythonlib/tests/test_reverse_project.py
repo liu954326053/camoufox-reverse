@@ -85,6 +85,16 @@ def test_session_exposes_trace_dir_as_a_stable_public_path(tmp_path):
     assert session.trace_dir == session.path / "trace"
 
 
+def test_manifest_snapshot_reads_and_validates_a_copy_from_disk(tmp_path):
+    session = ReverseProject.open(tmp_path / "analysis").create_session()
+
+    snapshot = session.manifest_snapshot()
+    snapshot["status"] = "complete"
+
+    assert json.loads(session.manifest_path.read_text())["status"] == "starting"
+    assert session.manifest_snapshot()["status"] == "starting"
+
+
 def test_mark_running_updates_manifest_through_public_lifecycle_api(tmp_path):
     session = ReverseProject.open(tmp_path / "analysis").create_session()
 
