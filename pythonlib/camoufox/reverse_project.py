@@ -403,10 +403,30 @@ class ReverseSession:
         if self._evidence_attached:
             store = self._evidence_store_ref() if self._evidence_store_ref else None
             if store is None:
-                raise ProjectError("EvidenceStore is unavailable for session finalization")
-            store.finalize(status=status)
+                try:
+                    from .reverse_evidence import EvidenceStore
+
+                    store = EvidenceStore(self)
+                except Exception as exc:
+                    raise ProjectError("EvidenceStore is unavailable for session finalization") from exc
+            try:
+                store.finalize(status=status)
+            except Exception as exc:
+                if exc.__class__.__name__ == "EvidenceError":
+                    raise ProjectError(str(exc)) from exc
+                raise
             return
-        self._close_manifest(status)
+        # A caller may close a session without having explicitly constructed an
+        # EvidenceStore. Create one lazily so a complete session always has a
+        # durable, rebuildable index rather than only a manifest transition.
+        try:
+            from .reverse_evidence import EvidenceStore
+
+            EvidenceStore(self).finalize(status=status)
+        except Exception as exc:
+            if exc.__class__.__name__ != "EvidenceError":
+                raise ProjectError("EvidenceStore is unavailable for session finalization") from exc
+            raise ProjectError(str(exc)) from exc
 
     def mark_running(
         self,

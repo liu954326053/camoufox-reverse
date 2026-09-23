@@ -168,6 +168,17 @@ def test_close_finalizes_session_as_complete(tmp_path):
     assert manifest["ended_at"] is not None
 
 
+def test_direct_close_creates_a_durable_session_index(tmp_path):
+    project = ReverseProject.open(tmp_path / "analysis")
+    session = project.create_session()
+
+    session.close()
+
+    index_path = project.indexes_dir / f"{session.session_id}.json"
+    assert index_path.is_file()
+    assert json.loads(index_path.read_text())["session_id"] == session.session_id
+
+
 def test_mark_incomplete_finalizes_session_without_secret_error_fields(tmp_path):
     session = ReverseProject.open(tmp_path / "analysis").create_session()
 
