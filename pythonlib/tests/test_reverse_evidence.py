@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from camoufox import reverse_evidence
 from camoufox.reverse_evidence import EvidenceError, EvidenceStore
 from camoufox.reverse_project import ReverseProject
 
@@ -136,6 +137,128 @@ def test_rebuild_index_can_read_incomplete_session_and_reports_event_loss(tmp_pa
     assert index["files"]["raw/events.jsonl"]["event_count"] == 1
 
 
+def test_complete_session_rejects_rebuild_and_preserves_existing_index(tmp_path):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/response.bin", b"before")
+    index_path = store.rebuild_index()
+    before = index_path.read_bytes()
+    session.close()
+
+    with pytest.raises(EvidenceError):
+        EvidenceStore(session).rebuild_index()
+
+    assert index_path.read_bytes() == before
+
+
+def test_parent_symlink_replacement_between_mkdir_and_open_cannot_redirect_write(
+    tmp_path, monkeypatch
+):
+    session, store = _store(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    nested = session.path / "raw/nested"
+    original_open = reverse_evidence.os.open
+    replaced = False
+
+    def replace_before_open(path, *args, **kwargs):
+        nonlocal replaced
+        if (
+            path == "nested"
+            and kwargs.get("dir_fd") is not None
+            and nested.exists()
+            and not replaced
+        ):
+            replaced = True
+            nested.rmdir()
+            nested.symlink_to(outside, target_is_directory=True)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(reverse_evidence.os, "open", replace_before_open)
+
+    with pytest.raises(EvidenceError):
+        store.append_bytes("raw/nested/evidence.bin", b"must-stay-inside")
+
+    assert not (outside / "evidence.bin").exists()
+
+
+def test_registry_is_durable_source_and_rebuild_recovers_manifest_after_write_failure(
+    tmp_path, monkeypatch
+):
+    session, store = _store(tmp_path)
+    path = "raw/response.bin"
+    payload = b"durable"
+    store.append_bytes(path, payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    original_write_manifest = reverse_evidence.reverse_project._write_manifest
+
+    def fail_manifest_write(manifest_path, manifest):
+        if manifest_path == session.manifest_path:
+            raise reverse_evidence.reverse_project.ProjectError("injected failure")
+        return original_write_manifest(manifest_path, manifest)
+
+    monkeypatch.setattr(reverse_evidence.reverse_project, "_write_manifest", fail_manifest_write)
+    with pytest.raises(EvidenceError):
+        store.register_artifact(path, digest, len(payload), "response")
+
+    monkeypatch.setattr(
+        reverse_evidence.reverse_project, "_write_manifest", original_write_manifest
+    )
+    index_path = EvidenceStore(session).rebuild_index()
+
+    manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["artifacts"] == [
+        {"path": path, "sha256": digest, "size": len(payload), "kind": "response"}
+    ]
+    assert json.loads(index_path.read_text(encoding="utf-8"))["artifacts"][0]["path"] == path
+
+
+@pytest.mark.parametrize(
+    ("size", "sha256"),
+    [(999, hashlib.sha256(b"actual").hexdigest()), (6, "0" * 64)],
+)
+def test_register_artifact_rejects_metadata_mismatch(tmp_path, size, sha256):
+    session, store = _store(tmp_path)
+    path = "raw/actual.bin"
+    store.append_bytes(path, b"actual")
+
+    with pytest.raises(EvidenceError):
+        store.register_artifact(path, sha256, size, "response")
+
+    assert not (session.path / "raw/artifacts.jsonl").exists()
+
+
+def test_register_artifact_requires_existing_regular_file(tmp_path):
+    session, store = _store(tmp_path)
+
+    with pytest.raises(EvidenceError):
+        store.register_artifact("raw/missing.bin", "0" * 64, 0, "response")
+
+
+def test_duplicate_metadata_uses_full_tie_breaker(tmp_path):
+    project = ReverseProject.open(tmp_path / "p")
+    first_session = project.create_session()
+    second_session = project.create_session()
+    first_store = EvidenceStore(first_session)
+    second_store = EvidenceStore(second_session)
+    payload = b"same"
+    digest = hashlib.sha256(payload).hexdigest()
+    path = "raw/same.bin"
+    for store in (first_store, second_store):
+        store.append_bytes(path, payload)
+    first_store.register_artifact(path, digest, len(payload), "z-kind")
+    first_store.register_artifact(path, digest, len(payload), "a-kind")
+    second_store.register_artifact(path, digest, len(payload), "a-kind")
+    second_store.register_artifact(path, digest, len(payload), "z-kind")
+
+    first_index = json.loads(first_store.rebuild_index().read_text(encoding="utf-8"))
+    second_index = json.loads(second_store.rebuild_index().read_text(encoding="utf-8"))
+    first_index.pop("session_id")
+    second_index.pop("session_id")
+
+    assert first_index == second_index
+    assert [item["kind"] for item in first_index["artifacts"]] == ["a-kind", "z-kind"]
+
+
 def test_register_artifact_rejects_completed_session_without_writing_registry(tmp_path):
     session, store = _store(tmp_path)
     session.close()
@@ -144,6 +267,16 @@ def test_register_artifact_rejects_completed_session_without_writing_registry(tm
         store.register_artifact("raw/late.bin", "0" * 64, 0, "response")
 
     assert not (session.path / "raw/artifacts.jsonl").exists()
+
+
+def test_finalize_builds_index_before_marking_session_complete(tmp_path):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/response.bin", b"complete")
+
+    index_path = store.finalize()
+
+    assert index_path.exists()
+    assert json.loads(session.manifest_path.read_text(encoding="utf-8"))["status"] == "complete"
 
 
 def test_index_sorting_is_independent_of_raw_file_creation_order(tmp_path):

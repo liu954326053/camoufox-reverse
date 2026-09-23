@@ -22,6 +22,8 @@ except ImportError:  # pragma: no cover
 
 PathLike = Union[str, os.PathLike[str]]
 _REGISTRY_PATH = "raw/artifacts.jsonl"
+_DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 class EvidenceError(RuntimeError):
@@ -58,57 +60,109 @@ class EvidenceStore:
     def __init__(self, session: ReverseSession):
         if not isinstance(session, ReverseSession):
             raise TypeError("session must be a ReverseSession")
+        if fcntl is None or os.open not in getattr(os, "supports_dir_fd", set()):
+            raise EvidenceError("Secure evidence storage requires POSIX dirfd support")
         self.session = session
         self.root = session.path.resolve(strict=True)
         self.raw_dir = session.raw_dir.resolve(strict=True)
         if self.raw_dir.parent != self.root or not self.raw_dir.is_dir():
             raise EvidenceError("Session raw directory is invalid")
+        try:
+            self._root_fd = os.open(self.root, _DIR_FLAGS)
+        except OSError as exc:
+            raise EvidenceError("Cannot open session root securely") from exc
         self._lock_path = self.root / ".evidence.lock"
 
-    def _ensure_open(self) -> None:
+    def __del__(self):
+        descriptor = getattr(self, "_root_fd", None)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._root_fd = None
+
+    def _manifest(self) -> dict[str, Any]:
         try:
-            manifest = reverse_project.ReverseProject._read_manifest(
+            return reverse_project.ReverseProject._read_manifest(
                 self.session.manifest_path, self.session.session_id
             )
         except reverse_project.ProjectError as exc:
             raise EvidenceError("Cannot read session manifest") from exc
-        if manifest.get("status") == "complete":
+
+    def _ensure_open(self) -> None:
+        if self._manifest().get("status") == "complete":
             raise EvidenceError("Complete sessions are immutable")
 
-    def _path(self, relative_path: PathLike) -> tuple[str, Path]:
+    @staticmethod
+    def _parts(relative_path: PathLike) -> tuple[str, tuple[str, ...]]:
         try:
             raw_path = os.fspath(relative_path)
         except TypeError as exc:
             raise EvidenceError("Artifact path must be path-like") from exc
         candidate = Path(raw_path)
-        if not raw_path or candidate.is_absolute() or ".." in candidate.parts:
+        if not raw_path or candidate.is_absolute():
             raise EvidenceError("Artifact path must stay inside the session")
-        if not candidate.parts or candidate == Path("."):
-            raise EvidenceError("Artifact path must be non-empty")
-        current = self.root
-        for part in candidate.parts:
-            current /= part
-            if current.is_symlink():
-                raise EvidenceError("Artifact path cannot contain symlinks")
-        resolved = (self.root / candidate).resolve(strict=False)
-        try:
-            resolved.relative_to(self.root)
-        except ValueError as exc:
-            raise EvidenceError("Artifact path escapes the session") from exc
-        return candidate.as_posix(), resolved
+        parts = candidate.parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise EvidenceError("Artifact path must stay inside the session")
+        return candidate.as_posix(), parts
 
-    @staticmethod
-    def _make_parents(path: Path, root: Path) -> None:
-        current = root
-        for part in path.parent.relative_to(root).parts:
-            current /= part
-            if current.is_symlink() or (current.exists() and not current.is_dir()):
-                raise EvidenceError("Artifact parent is not a directory")
-            current.mkdir(mode=0o700, exist_ok=True)
+    def _open_directory(self, parent_fd: int, name: str, create: bool) -> int:
+        try:
+            descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+        except FileNotFoundError:
+            if not create:
+                raise EvidenceError(f"Evidence directory does not exist: {name}")
             try:
-                current.chmod(0o700)
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            try:
+                descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
             except OSError as exc:
-                raise EvidenceError(f"Cannot secure artifact directory: {current}") from exc
+                raise EvidenceError(f"Cannot open evidence directory: {name}") from exc
+        except OSError as exc:
+            raise EvidenceError(f"Cannot open evidence directory: {name}") from exc
+        try:
+            os.fchmod(descriptor, stat.S_IRWXU)
+        except OSError as exc:
+            os.close(descriptor)
+            raise EvidenceError(f"Cannot secure evidence directory: {name}") from exc
+        return descriptor
+
+    @contextmanager
+    def _parent_fd(self, parts: tuple[str, ...], create: bool) -> Iterator[int]:
+        descriptor = os.dup(self._root_fd)
+        try:
+            for name in parts[:-1]:
+                child = self._open_directory(descriptor, name, create)
+                os.close(descriptor)
+                descriptor = child
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def _open_relative(
+        self,
+        parts: tuple[str, ...],
+        flags: int,
+        mode: int = 0o600,
+        *,
+        create_parents: bool = False,
+        allow_missing: bool = False,
+    ) -> int | None:
+        with self._parent_fd(parts, create_parents) as parent_fd:
+            try:
+                return os.open(
+                    parts[-1], flags | _NOFOLLOW, mode, dir_fd=parent_fd
+                )
+            except FileNotFoundError:
+                if allow_missing:
+                    return None
+                raise EvidenceError(f"Evidence file does not exist: {'/'.join(parts)}")
+            except OSError as exc:
+                raise EvidenceError(f"Cannot open evidence file: {'/'.join(parts)}") from exc
 
     @staticmethod
     def _write_all(descriptor: int, data: bytes) -> None:
@@ -124,17 +178,15 @@ class EvidenceStore:
 
     def _append(self, relative_path: PathLike, data: bytes) -> str:
         self._ensure_open()
-        normalized, path = self._path(relative_path)
-        self._make_parents(path, self.root)
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        normalized, parts = self._parts(relative_path)
+        descriptor = self._open_relative(
+            parts,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+            create_parents=True,
+        )
+        assert descriptor is not None
         try:
-            descriptor = os.open(path, flags, 0o600)
             os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
-        except OSError as exc:
-            raise EvidenceError(f"Cannot open evidence file: {path}") from exc
-        try:
             with _locked(descriptor):
                 self._write_all(descriptor, data)
                 try:
@@ -143,7 +195,6 @@ class EvidenceStore:
                     raise EvidenceError("Cannot fsync evidence file") from exc
         finally:
             os.close(descriptor)
-        _fsync_directory(path.parent)
         return normalized
 
     def append_jsonl(self, relative_path: PathLike, event: Mapping[str, Any]) -> str:
@@ -166,15 +217,44 @@ class EvidenceStore:
         return self._append(relative_path, bytes(data))
 
     def _open_lock(self) -> int:
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        descriptor = self._open_relative(
+            (".evidence.lock",), os.O_RDWR | os.O_CREAT
+        )
+        assert descriptor is not None
+        os.fchmod(descriptor, stat.S_IRUSR | stat.S_IWUSR)
+        return descriptor
+
+    def _open_existing(self, parts: tuple[str, ...]) -> int | None:
+        return self._open_relative(parts, os.O_RDONLY, allow_missing=True)
+
+    @staticmethod
+    def _read_fd(descriptor: int) -> bytes:
         try:
-            descriptor = os.open(self._lock_path, flags, 0o600)
-            os.fchmod(descriptor, 0o600)
-            return descriptor
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
         except OSError as exc:
-            raise EvidenceError("Cannot open evidence lock") from exc
+            raise EvidenceError("Cannot read evidence file") from exc
+
+    @staticmethod
+    def _digest_fd(descriptor: int) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+        except OSError as exc:
+            raise EvidenceError("Cannot hash evidence file") from exc
+        return size, digest.hexdigest()
 
     @staticmethod
     def _registration(path: str, sha256: str, size: int, kind: str) -> dict[str, Any]:
@@ -189,93 +269,74 @@ class EvidenceStore:
     def register_artifact(
         self, relative_path: PathLike, sha256: str, size: int, kind: str
     ) -> dict[str, Any]:
-        """Append artifact metadata to the raw registry and session manifest."""
+        """Register metadata after validating the current regular file contents."""
         self._ensure_open()
-        normalized, path = self._path(relative_path)
-        if path.is_symlink() or (path.exists() and not path.is_file()):
-            raise EvidenceError("Registered artifact must be a regular file")
+        normalized, parts = self._parts(relative_path)
         record = self._registration(normalized, sha256, size, kind)
-        payload = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        ) + b"\n"
         lock = self._open_lock()
         try:
             with _locked(lock):
+                manifest = self._manifest()
+                if manifest.get("status") == "complete":
+                    raise EvidenceError("Complete sessions are immutable")
+                descriptor = self._open_existing(parts)
+                if descriptor is None:
+                    raise EvidenceError("Registered artifact does not exist")
                 try:
-                    manifest = reverse_project.ReverseProject._read_manifest(
-                        self.session.manifest_path, self.session.session_id
-                    )
-                    if manifest.get("status") == "complete":
-                        raise EvidenceError("Complete sessions are immutable")
-                    artifacts = manifest.setdefault("artifacts", [])
-                    if not isinstance(artifacts, list):
-                        raise EvidenceError("Session artifact registry is invalid")
-                    self._append(_REGISTRY_PATH, payload)
-                    artifacts.append(record)
-                    reverse_project._write_manifest(self.session.manifest_path, manifest)
-                except reverse_project.ProjectError as exc:
-                    raise EvidenceError("Cannot update session artifact registry") from exc
+                    file_stat = os.fstat(descriptor)
+                    if not stat.S_ISREG(file_stat.st_mode):
+                        raise EvidenceError("Registered artifact must be a regular file")
+                    with _locked(descriptor):
+                        actual_size, actual_hash = self._digest_fd(descriptor)
+                        if actual_size != size or actual_hash != sha256:
+                            raise EvidenceError(
+                                "Registered artifact metadata does not match file contents"
+                            )
+                        payload = json.dumps(
+                            record, ensure_ascii=False, separators=(",", ":")
+                        ).encode("utf-8") + b"\n"
+                        self._append(_REGISTRY_PATH, payload)
+                        artifacts = manifest.setdefault("artifacts", [])
+                        if not isinstance(artifacts, list):
+                            raise EvidenceError("Session artifact registry is invalid")
+                        artifacts.append(record)
+                        try:
+                            reverse_project._write_manifest(
+                                self.session.manifest_path, manifest
+                            )
+                        except Exception as exc:
+                            raise EvidenceError(
+                                "Registry durable; manifest reconciliation required"
+                            ) from exc
+                finally:
+                    os.close(descriptor)
         finally:
             os.close(lock)
         return record
 
     def _read_registry(self) -> list[dict[str, Any]]:
-        path = self.root / _REGISTRY_PATH
-        if not path.exists():
+        parts = tuple(_REGISTRY_PATH.split("/"))
+        descriptor = self._open_existing(parts)
+        if descriptor is None:
             return []
-        records: list[dict[str, Any]] = []
         try:
-            with path.open("r", encoding="utf-8") as stream:
-                for line in stream:
-                    if line.strip():
-                        value = json.loads(line)
-                        if isinstance(value, dict) and isinstance(value.get("path"), str):
-                            records.append(value)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            payload = self._read_fd(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            text = payload.decode("utf-8")
+            records = []
+            for line in text.splitlines():
+                if line.strip():
+                    value = json.loads(line)
+                    if not isinstance(value, dict) or not isinstance(value.get("path"), str):
+                        raise ValueError("invalid registry record")
+                    records.append(value)
+            return records
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
             raise EvidenceError("Cannot read raw artifact registry") from exc
-        return records
 
-    @staticmethod
-    def _digest(path: Path) -> tuple[int, str]:
-        digest = hashlib.sha256()
-        size = 0
-        try:
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    size += len(chunk)
-                    digest.update(chunk)
-        except OSError as exc:
-            raise EvidenceError(f"Cannot read raw evidence file: {path}") from exc
-        return size, digest.hexdigest()
-
-    @staticmethod
-    def _events(path: Path) -> tuple[int, int, list[int]]:
-        if path.suffix != ".jsonl":
-            return 0, 0, []
-        count = malformed = 0
-        sequences: list[int] = []
-        try:
-            with path.open("r", encoding="utf-8") as stream:
-                for line in stream:
-                    if not line.strip():
-                        continue
-                    try:
-                        value = json.loads(line)
-                    except (UnicodeError, json.JSONDecodeError):
-                        malformed += 1
-                        continue
-                    if not isinstance(value, dict):
-                        malformed += 1
-                        continue
-                    count += 1
-                    sequence = value.get("sequence")
-                    if isinstance(sequence, int) and not isinstance(sequence, bool):
-                        sequences.append(sequence)
-        except OSError as exc:
-            raise EvidenceError(f"Cannot read JSONL evidence file: {path}") from exc
-        return count, malformed, sequences
-
-    def _raw_files(self) -> list[tuple[str, Path]]:
+    def _raw_files(self) -> list[tuple[str, tuple[str, ...]]]:
         files = []
         for path in sorted(self.raw_dir.rglob("*")):
             if not path.is_file() or path.is_symlink():
@@ -283,21 +344,76 @@ class EvidenceStore:
             relative = path.relative_to(self.root).as_posix()
             if relative == _REGISTRY_PATH or path.name.startswith("."):
                 continue
-            files.append((relative, path))
+            files.append((relative, tuple(relative.split("/"))))
         return files
 
+    def _file_info(self, parts: tuple[str, ...]) -> tuple[int, str]:
+        descriptor = self._open_existing(parts)
+        if descriptor is None:
+            raise EvidenceError("Raw evidence file disappeared during indexing")
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise EvidenceError("Raw evidence path is not a regular file")
+            return self._digest_fd(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _event_info(self, parts: tuple[str, ...]) -> tuple[int, int, list[int]]:
+        if not parts[-1].endswith(".jsonl"):
+            return 0, 0, []
+        descriptor = self._open_existing(parts)
+        if descriptor is None:
+            raise EvidenceError("JSONL evidence file disappeared during indexing")
+        try:
+            payload = self._read_fd(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return 0, 1, []
+        count = malformed = 0
+        sequences: list[int] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            if not isinstance(value, dict):
+                malformed += 1
+                continue
+            count += 1
+            sequence = value.get("sequence")
+            if isinstance(sequence, int) and not isinstance(sequence, bool):
+                sequences.append(sequence)
+        return count, malformed, sequences
+
     def rebuild_index(self) -> Path:
-        """Rebuild an index from disk, including incomplete sessions."""
+        """Rebuild an incomplete-session index and reconcile its manifest."""
+        manifest = self._manifest()
+        if manifest.get("status") == "complete":
+            raise EvidenceError("Complete sessions are immutable")
         records = self._read_registry()
+        if manifest.get("artifacts") != records:
+            manifest["artifacts"] = records
+            try:
+                reverse_project._write_manifest(self.session.manifest_path, manifest)
+            except Exception as exc:
+                raise EvidenceError("Cannot reconcile session artifact manifest") from exc
+
         registered: dict[str, list[dict[str, Any]]] = {}
         for record in records:
             registered.setdefault(record["path"], []).append(record)
         files: dict[str, dict[str, Any]] = {}
         artifacts: list[dict[str, Any]] = []
         malformed_total = 0
-        for relative, path in self._raw_files():
-            byte_count, content_hash = self._digest(path)
-            event_count, malformed, sequences = self._events(path)
+        for relative, parts in self._raw_files():
+            byte_count, content_hash = self._file_info(parts)
+            event_count, malformed, sequences = self._event_info(parts)
             malformed_total += malformed
             files[relative] = {
                 "bytes": byte_count,
@@ -309,7 +425,7 @@ class EvidenceStore:
                     "path": relative,
                     "sha256": content_hash,
                     "size": byte_count,
-                    "kind": "jsonl" if path.suffix == ".jsonl" else "raw",
+                    "kind": "jsonl" if relative.endswith(".jsonl") else "raw",
                 }
             ]
             for entry in entries:
@@ -329,7 +445,12 @@ class EvidenceStore:
             for entry in entries:
                 item = dict(entry)
                 item.update(
-                    {"bytes": 0, "event_count": 0, "content_sha256": None, "event_sequence": None}
+                    {
+                        "bytes": 0,
+                        "event_count": 0,
+                        "content_sha256": None,
+                        "event_sequence": None,
+                    }
                 )
                 artifacts.append(item)
         artifacts.sort(
@@ -337,15 +458,15 @@ class EvidenceStore:
                 item.get("path", ""),
                 item.get("event_sequence") is None,
                 item.get("event_sequence") if item.get("event_sequence") is not None else 0,
+                item.get("kind", ""),
+                item.get("size", 0),
                 item.get("sha256", ""),
+                item.get("content_sha256") or "",
+                item.get("bytes", 0),
+                item.get("event_count", 0),
+                json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             )
         )
-        try:
-            manifest = reverse_project.ReverseProject._read_manifest(
-                self.session.manifest_path, self.session.session_id
-            )
-        except reverse_project.ProjectError as exc:
-            raise EvidenceError("Cannot read session manifest") from exc
         index = {
             "schema": 1,
             "session_id": self.session.session_id,
@@ -378,21 +499,25 @@ class EvidenceStore:
         return index_path
 
     def flush(self) -> None:
-        """Fsync raw files and directories before session shutdown."""
+        """Fsync raw files and registry before session shutdown."""
         self._ensure_open()
-        for _, path in self._raw_files():
+        paths = [parts for _, parts in self._raw_files()]
+        paths.append(tuple(_REGISTRY_PATH.split("/")))
+        for parts in paths:
+            descriptor = self._open_existing(parts)
+            if descriptor is None:
+                continue
             try:
-                descriptor = os.open(path, os.O_RDONLY)
-                try:
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
+                os.fsync(descriptor)
             except OSError as exc:
-                raise EvidenceError(f"Cannot fsync evidence file: {path}") from exc
+                raise EvidenceError("Cannot fsync evidence file") from exc
+            finally:
+                os.close(descriptor)
         _fsync_directory(self.raw_dir)
         _fsync_directory(self.root)
 
-    def close(self, status: str = "complete") -> Path:
+    def finalize(self, status: str = "complete") -> Path:
+        """Flush, build the index, then finalize the associated session."""
         self.flush()
         index_path = self.rebuild_index()
         try:
@@ -401,12 +526,16 @@ class EvidenceStore:
             raise EvidenceError("Cannot finalize evidence session") from exc
         return index_path
 
+    def close(self, status: str = "complete") -> Path:
+        """Compatibility alias for :meth:`finalize`."""
+        return self.finalize(status=status)
+
     def __enter__(self) -> "EvidenceStore":
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         if exc_type is None:
-            self.close()
+            self.finalize()
         else:
             try:
                 self.flush()
