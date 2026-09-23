@@ -19,6 +19,11 @@ class ReverseProjectContractTests(unittest.TestCase):
         self.assertEqual(capabilities["property_trace_hooks"], 77)
         self.assertIn("exclusive_session_files", capabilities["property_trace_features"])
         self.assertIn("loss_status", capabilities["property_trace_features"])
+        self.assertIn("durable_loss_metadata", capabilities["property_trace_features"])
+        self.assertEqual(
+            capabilities["property_trace_metadata_artifact"],
+            "traces/*.meta.json",
+        )
         self.assertEqual(
             capabilities["property_trace_status_fields"],
             ["state", "session_id", "events", "dropped", "detail"],

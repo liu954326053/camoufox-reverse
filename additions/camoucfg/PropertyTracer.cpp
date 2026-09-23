@@ -237,7 +237,6 @@ void PropertyTracer::RecordSlow(const char* object, const char* property,
   if (!mEnabled.load(std::memory_order_acquire)) return;
   if (mGeneration.load(std::memory_order_acquire) != generation) return;
   if (mEventsThisSession >= mMaxEventsPerSession) {
-    mSaturated.store(true, std::memory_order_release);
     ++mDroppedEventsThisSession;
     return;
   }
@@ -352,17 +351,62 @@ void PropertyTracer::WriteBatch(
 
 void PropertyTracer::WriteStatus(const char* state, const char* detail) {
   if (mStatusPath.empty()) return;
+  uint32_t events = 0;
+  uint32_t dropped = 0;
+  {
+    std::lock_guard<std::mutex> lock(mBufferMutex);
+    events = mEventsThisSession;
+    dropped = mDroppedEventsThisSession;
+  }
   std::ofstream file(NativePath(mStatusPath), std::ios::trunc);
   if (!file) return;
-  file << state << " " << (mSessionId == 0 ? 0 : mSessionId - 1)
-       << " events=" << mEventsThisSession
-       << " dropped=" << mDroppedEventsThisSession;
+  file << state << " " << mActiveSessionId.load(std::memory_order_acquire)
+       << " events=" << events << " dropped=" << dropped;
   if (detail) file << " " << detail;
   file << "\n";
   file.flush();
 #ifndef _WIN32
   chmod(mStatusPath.c_str(), 0600);
 #endif
+}
+
+void PropertyTracer::WriteSessionMetadata(const char* state, const char* detail) {
+  if (mCurrentMetadataPath.empty()) return;
+
+  uint32_t events = 0;
+  uint32_t dropped = 0;
+  {
+    std::lock_guard<std::mutex> lock(mBufferMutex);
+    events = mEventsThisSession;
+    dropped = mDroppedEventsThisSession;
+  }
+
+  const std::string temporaryPath = mCurrentMetadataPath + ".tmp";
+  std::ofstream file(NativePath(temporaryPath), std::ios::trunc);
+  if (!file) return;
+  file << "{\"state\":";
+  std::string jsonState;
+  AppendJsonString(jsonState, state ? state : "");
+  file << jsonState << ",\"session_id\":"
+       << mActiveSessionId.load(std::memory_order_acquire)
+       << ",\"events\":" << events << ",\"dropped\":" << dropped;
+  if (detail) {
+    std::string jsonDetail;
+    AppendJsonString(jsonDetail, detail);
+    file << ",\"detail\":" << jsonDetail;
+  }
+  file << "}\n";
+  file.flush();
+  if (!file) {
+    UnlinkPath(temporaryPath);
+    return;
+  }
+  file.close();
+
+  std::error_code error;
+  std::filesystem::rename(NativePath(temporaryPath),
+                          NativePath(mCurrentMetadataPath), error);
+  if (error) UnlinkPath(temporaryPath);
 }
 
 void PropertyTracer::StartNewSession() {
@@ -390,6 +434,9 @@ void PropertyTracer::StartNewSession() {
 
   mCurrentFd = fd;
   mCurrentLogPath = path;
+  mCurrentMetadataPath = std::string(path) + ".meta.json";
+  const uint32_t activeSessionId = mSessionId - 1;
+  mActiveSessionId.store(activeSessionId, std::memory_order_release);
   {
     std::lock_guard<std::mutex> bufferLock(mBufferMutex);
     mSessionStartTime = std::chrono::steady_clock::now();
@@ -400,7 +447,6 @@ void PropertyTracer::StartNewSession() {
     mEventsThisSession = 0;
     mDroppedEventsThisSession = 0;
     mSequence = 0;
-    mSaturated.store(false, std::memory_order_release);
     mWriteFailed.store(false, std::memory_order_release);
     mGeneration.fetch_add(1, std::memory_order_acq_rel);
   }
@@ -422,8 +468,18 @@ void PropertyTracer::StopSession() {
     }
     close(mCurrentFd);
     mCurrentFd = -1;
+    WriteSessionMetadata("off",
+                         mWriteFailed.load(std::memory_order_acquire)
+                             ? "write_error"
+                             : nullptr);
+    mCurrentMetadataPath.clear();
   }
-  if (mDroppedEventsThisSession > 0) {
+  uint32_t dropped = 0;
+  {
+    std::lock_guard<std::mutex> bufferLock(mBufferMutex);
+    dropped = mDroppedEventsThisSession;
+  }
+  if (dropped > 0) {
     fprintf(stderr,
             "PropertyTracer: session event cap reached; later events skipped\n");
   }

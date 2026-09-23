@@ -13,6 +13,7 @@
     "dropped",
     "detail"
   ],
+  "property_trace_metadata_artifact": "traces/*.meta.json",
   "property_trace_features": [
     "async_buffered_io",
     "event_kind",
@@ -22,6 +23,7 @@
     "exclusive_session_files",
     "control_ack",
     "loss_status",
+    "durable_loss_metadata",
     "utf8_paths",
     "process_scope"
   ]

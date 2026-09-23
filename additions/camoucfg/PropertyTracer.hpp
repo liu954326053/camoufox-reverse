@@ -98,14 +98,15 @@ class PropertyTracer {
   void StartNewSession();
   void StopSession();
   void WriteStatus(const char* state, const char* detail = nullptr);
+  void WriteSessionMetadata(const char* state, const char* detail = nullptr);
   bool ShouldRecord(const char* objName) const;
 
   // State
   std::atomic<bool> mEnabled{false};
-  std::atomic<bool> mSaturated{false};
   std::atomic<bool> mWriteFailed{false};
   std::atomic<bool> mStop{false};
   std::atomic<uint64_t> mGeneration{0};
+  std::atomic<uint32_t> mActiveSessionId{0};
   bool mInitialized{false};
 
   // Config
@@ -120,6 +121,7 @@ class PropertyTracer {
   std::mutex mSessionMutex;
   int mCurrentFd{-1};
   std::string mCurrentLogPath;
+  std::string mCurrentMetadataPath;
   uint32_t mSessionId{0};
   uint32_t mEventsThisSession{0};
   uint32_t mDroppedEventsThisSession{0};
