@@ -330,6 +330,8 @@ class ReverseProject:
             or manifest["event_loss"] < 0
         ):
             raise ProjectError("Session manifest values are invalid")
+        if "trace_enabled" in manifest and type(manifest["trace_enabled"]) is not bool:
+            raise ProjectError("Session manifest shape is invalid")
         if manifest["ended_at"] is not None and type(manifest["ended_at"]) is not str:
             raise ProjectError("Session manifest shape is invalid")
         return manifest
@@ -378,11 +380,15 @@ class ReverseSession:
         self._evidence_attached = True
         self._evidence_store_ref = weakref.ref(store)
 
-    def _close_manifest_locked(self, status: str) -> None:
+    def _close_manifest_locked(self, status: str, event_loss: int | None = None) -> None:
         manifest = self.project._read_manifest(self.manifest_path, self.session_id)
         if manifest.get("status") == "complete":
             raise ProjectError("Complete sessions are immutable")
         manifest["status"] = status
+        if event_loss is not None:
+            if not isinstance(event_loss, int) or isinstance(event_loss, bool) or event_loss < 0:
+                raise ProjectError("Invalid session event loss")
+            manifest["event_loss"] = event_loss
         manifest["ended_at"] = _timestamp()
         _write_manifest(self.manifest_path, manifest)
         self._manifest = manifest
@@ -391,11 +397,11 @@ class ReverseSession:
         with _session_lock(self.path):
             self._close_manifest_locked(status)
 
-    def _close_from_evidence(self, status: str) -> None:
+    def _close_from_evidence(self, status: str, event_loss: int | None = None) -> None:
         """Finalize the lifecycle after EvidenceStore made its durable snapshot."""
         if status not in {"complete", "incomplete"}:
             raise ProjectError("Invalid session final status")
-        self._close_manifest_locked(status)
+        self._close_manifest_locked(status, event_loss=event_loss)
 
     def close(self, status: str = "complete") -> None:
         if status not in {"complete", "incomplete"}:
@@ -415,6 +421,7 @@ class ReverseSession:
         self,
         *,
         trace_profile: str | None = None,
+        trace_enabled: bool | None = None,
         browser_version: str | None = None,
         proxy: dict[str, Any] | None = None,
     ) -> None:
@@ -427,6 +434,8 @@ class ReverseSession:
             manifest["ended_at"] = None
             if trace_profile is not None:
                 manifest["trace_profile"] = trace_profile
+            if trace_enabled is not None:
+                manifest["trace_enabled"] = trace_enabled
             if browser_version is not None:
                 manifest["browser_version"] = browser_version
             if proxy is not None:

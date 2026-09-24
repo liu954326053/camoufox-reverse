@@ -33,6 +33,11 @@ _TRACE_PROFILES: dict[str, dict[str, Any]] = {
         "maxEventsPerSession": 500_000,
     },
 }
+_DIRECTORY_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 def _proxy_dict(proxy_url: str) -> dict[str, str]:
@@ -76,6 +81,31 @@ def _trace_dir(session: ReverseSession) -> Path:
     except OSError as exc:
         raise ValueError("session trace directory is not secure") from exc
     return trace_dir
+
+
+def _runtime_tmp_dir(session: ReverseSession) -> Path:
+    descriptor = None
+    try:
+        descriptor = os.open(session.path, _DIRECTORY_FLAGS)
+        for name in ("runtime", "tmp"):
+            try:
+                os.mkdir(name, 0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            child = os.open(name, _DIRECTORY_FLAGS, dir_fd=descriptor)
+            try:
+                os.fchmod(child, 0o700)
+            except OSError:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+    except OSError as exc:
+        raise ValueError("runtime temporary directory is invalid or cannot be secured") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return session.path / "runtime" / "tmp"
 
 
 def reverse_launch_options(
@@ -123,8 +153,7 @@ def reverse_launch_options(
 
         launch_kwargs = dict(kwargs)
         environment = dict(launch_kwargs.get("env") or os.environ)
-        temporary = session.path / "runtime" / "tmp"
-        temporary.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = _runtime_tmp_dir(session)
         environment.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
         if enable_trace:
             environment["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
@@ -141,6 +170,7 @@ def reverse_launch_options(
         options = launch_options(**launch_kwargs)
         session.mark_running(
             trace_profile=trace_profile,
+            trace_enabled=enable_trace,
             browser_version=browser_version or launch_kwargs.get("browser"),
             proxy=(
                 {

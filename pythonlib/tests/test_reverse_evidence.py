@@ -28,6 +28,38 @@ def test_registered_malformed_events_count_once_across_snapshot_and_kinds(tmp_pa
     assert index["event_loss"] == 1
 
 
+def test_malformed_events_from_cumulative_snapshots_are_not_double_counted(tmp_path):
+    _, store = _store(tmp_path)
+    source = "raw/events.jsonl"
+    first = b'{"sequence":1}\nnot-json\n'
+    second = first + b'{"sequence":2}\n'
+    store.append_bytes(source, first)
+    store.register_artifact(source, hashlib.sha256(first).hexdigest(), len(first), "network")
+    store.append_bytes(source, second[len(first):])
+    store.register_artifact(source, hashlib.sha256(second).hexdigest(), len(second), "network")
+
+    index = json.loads(store.rebuild_index().read_text())
+
+    assert index["event_loss"] == 1
+
+
+def test_enabled_trace_without_native_files_is_an_explicit_gap(tmp_path, monkeypatch):
+    from camoufox import reverse_launch
+
+    monkeypatch.setattr(reverse_launch, "launch_options", lambda **kwargs: kwargs)
+    _, session = reverse_launch.reverse_launch_options(project_dir=tmp_path / "p")
+    store = EvidenceStore(session)
+    index = json.loads(store.rebuild_index().read_text())
+
+    assert session.manifest_snapshot()["trace_enabled"] is True
+    assert index["event_loss_complete"] is False
+    assert {"source_path": "trace", "reason": "missing_native_trace"} in index[
+        "event_loss_gaps"
+    ]
+    store.finalize()
+    assert session.manifest_snapshot()["status"] == "incomplete"
+
+
 def _native_trace(store, *, payload=b'{"k":0,"q":0,"u":1,"w":2,"s":"test"}\n', metadata=None):
     source = "trace/traces/123_0.jsonl"
     store.append_bytes(source, payload)
@@ -178,6 +210,13 @@ def test_artifact_path_cannot_escape_session(tmp_path):
         store.append_bytes("../outside", b"bad")
 
     assert not (session.path.parent / "outside").exists()
+
+
+def test_artifact_path_rejects_nul_bytes_with_evidence_error(tmp_path):
+    _, store = _store(tmp_path)
+
+    with pytest.raises(EvidenceError):
+        store.append_bytes("raw/\x00outside", b"bad")
 
 
 def test_append_jsonl_writes_one_complete_json_object_per_line(tmp_path):
@@ -447,6 +486,18 @@ def test_finalize_builds_index_before_marking_session_complete(tmp_path):
 
     assert index_path.exists()
     assert json.loads(session.manifest_path.read_text(encoding="utf-8"))["status"] == "complete"
+
+
+def test_finalize_persists_event_loss_without_double_counting_on_rebuild(tmp_path):
+    session, store = _store(tmp_path)
+    store.append_bytes("raw/events.jsonl", b"not-json\n")
+
+    index_path = store.finalize()
+
+    assert session.manifest_snapshot()["status"] == "incomplete"
+    assert session.manifest_snapshot()["event_loss"] == 1
+    assert json.loads(index_path.read_text())["event_loss"] == 1
+    assert json.loads(store.rebuild_index().read_text())["event_loss"] == 1
 
 
 def test_direct_session_close_builds_durable_index(tmp_path):

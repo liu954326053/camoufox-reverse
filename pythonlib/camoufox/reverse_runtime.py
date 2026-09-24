@@ -51,6 +51,7 @@ class AsyncReverseBrowser:
         self._dirty_requests: set[str] = set()
         self._metadata_versions: dict[str, int] = {}
         self._capture_errors: list[dict[str, Any]] = []
+        self._persisted_diagnostic_errors = 0
         self._accepting_tasks = True
         self._writes_closed = False
         self._capabilities: dict[str, Any] = {
@@ -91,14 +92,18 @@ class AsyncReverseBrowser:
                     self._attach_page(page)
             return self
         except BaseException as error:
+            cleanup_error = None
             if self._cm_entered and self._cm is not None:
                 try:
                     await self._cm.__aexit__(type(error), error, error.__traceback__)
-                except Exception as cleanup_error:
+                except BaseException as caught_cleanup_error:
+                    cleanup_error = caught_cleanup_error
                     self._record_error("browser_cleanup", cleanup_error)
                 finally:
                     self._cm_entered = False
             await self._mark_incomplete(error)
+            if cleanup_error is not None:
+                raise cleanup_error
             raise
 
     def _attach_page(self, page: Any) -> None:
@@ -324,6 +329,13 @@ class AsyncReverseBrowser:
                 continue
             for frame_index, frame in enumerate(tuple(accessible_frames)):
                 entry = {"page": page_index, "frame": frame_index, "url": frame.url}
+                if entry["url"] == "about:blank":
+                    # about:blank has an opaque origin, so sessionStorage is
+                    # intentionally unavailable rather than a capture failure.
+                    entry["storage"] = {}
+                    entry["status"] = "not_applicable"
+                    frames.append(entry)
+                    continue
                 try:
                     entry["storage"] = await asyncio.wait_for(frame.evaluate(
                         "() => Object.fromEntries(Object.entries(sessionStorage))"
@@ -483,9 +495,17 @@ class AsyncReverseBrowser:
                 except Exception as finalization_error:
                     self._record_error(stage, finalization_error)
         try:
+            self._persist_diagnostics()
+        except Exception as persistence_error:
+            self._record_error("diagnostics_persist", persistence_error)
+        try:
             self.session.mark_incomplete(error)
         except Exception as finalization_error:
             self._record_error("mark_incomplete", finalization_error)
+            try:
+                self._persist_diagnostics()
+            except Exception as persistence_error:
+                self._record_error("diagnostics_persist", persistence_error)
             try:
                 # Emergency lifecycle-only transition when the index cannot be built.
                 self.session._close_manifest("incomplete")
@@ -493,6 +513,23 @@ class AsyncReverseBrowser:
                 self._record_error("emergency_status", emergency_error)
                 raise EvidenceError("Capture incomplete; session status could not be persisted") from emergency_error
         return index_path
+
+    def _persist_diagnostics(self) -> Path | None:
+        if self.session is None or self.store is None:
+            return None
+        errors = self._capture_errors[self._persisted_diagnostic_errors:]
+        if not errors:
+            return None
+        relative = f"raw/diagnostics/{uuid.uuid4().hex}.jsonl"
+        payload = json.dumps(
+            {"timestamp": time.time(), "errors": errors},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        self.store.append_bytes(relative, payload)
+        self._persisted_diagnostic_errors = len(self._capture_errors)
+        return self.session.path / relative
 
     async def close(self, *, incomplete: bool = False) -> dict[str, Any]:
         if self._closed:
@@ -562,6 +599,17 @@ class AsyncReverseBrowser:
                     index_path = await self._mark_incomplete()
                 else:
                     index_path = self.store.finalize()
+                    if self.session.manifest_snapshot().get("status") == "incomplete":
+                        incomplete = True
+                        self._record_error(
+                            "evidence_integrity",
+                            RuntimeError("Evidence index reports loss or incomplete trace metadata"),
+                        )
+                        try:
+                            self._persist_diagnostics()
+                            index_path = self.store.rebuild_index()
+                        except Exception as error:
+                            self._record_error("integrity_diagnostics", error)
             elif self.session is not None:
                 if incomplete:
                     await self._mark_incomplete()

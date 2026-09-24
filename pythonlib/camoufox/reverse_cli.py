@@ -54,7 +54,28 @@ def _click_error_message(error: click.ClickException) -> str:
         if not hint.startswith("-"):
             hint = f"--{hint.replace('_', '-')}"
         return f"Missing option '{hint}'."
-    return str(error)
+    if isinstance(error, click.BadParameter):
+        parameter = getattr(error, "param", None)
+        options = getattr(parameter, "opts", ()) or ()
+        hint = options[0] if options else "option"
+        return f"Invalid value for '{hint}'."
+    return "Invalid command usage."
+
+
+def _safe_error_message(error: BaseException) -> str:
+    if isinstance(error, click.ClickException):
+        return _click_error_message(error)
+    if isinstance(error, InvalidIndexError):
+        return "Session index is invalid."
+    if isinstance(error, ProjectError):
+        return "Project or session operation failed."
+    if isinstance(error, EvidenceError):
+        return "Evidence operation failed."
+    if isinstance(error, (ValueError, TypeError)):
+        return "Invalid operation input."
+    if isinstance(error, OSError):
+        return "Filesystem operation failed."
+    return "Browser operation failed; details omitted to protect sensitive values."
 
 
 def _error_output(error: BaseException) -> None:
@@ -63,7 +84,7 @@ def _error_output(error: BaseException) -> None:
             "status": "error",
             "error": {
                 "code": _error_code(error),
-                "message": str(error) or "reverse-browser operation failed",
+                "message": _safe_error_message(error),
             },
         }
     )
@@ -94,7 +115,7 @@ class _JsonGroup(click.Group):
                     "status": "error",
                     "error": {
                         "code": _error_code(error),
-                        "message": _click_error_message(error),
+                        "message": _safe_error_message(error),
                     },
                 }
             )
@@ -355,11 +376,16 @@ def trace_index(project_dir: Path, session_id: str) -> None:
     def action() -> None:
         project = ReverseProject.open(project_dir)
         session = project.get_session(session_id)
-        index_path = EvidenceStore(session).rebuild_index()
+        EvidenceStore(session).rebuild_index()
+        index_path, index = _load_index(session)
+        manifest = session.manifest_snapshot()
         _json_output(
             {
                 "status": "ok",
                 "session_id": session.session_id,
+                "session_status": manifest["status"],
+                "event_loss": index["event_loss"],
+                "event_loss_complete": index.get("event_loss_complete"),
                 "artifacts": {"index": str(index_path)},
             }
         )
@@ -400,6 +426,7 @@ def report_build(project_dir: Path, session_id: str) -> None:
             {
                 "status": "ok",
                 "session_id": session.session_id,
+                "session_status": manifest["status"],
                 "artifacts": {"report": str(report_path), "index": str(index_path)},
             }
         )

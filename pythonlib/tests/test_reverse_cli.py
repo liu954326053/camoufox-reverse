@@ -98,7 +98,7 @@ def test_invalid_choice_is_json_error(runner, tmp_path):
             "--project-dir",
             str(tmp_path / "p"),
             "--trace-profile",
-            "invalid",
+            "id_token=fixture-token-value",
         ],
     )
 
@@ -106,6 +106,7 @@ def test_invalid_choice_is_json_error(runner, tmp_path):
     payload = json.loads(result.output)
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "invalid_choice"
+    assert "fixture-token-value" not in result.output
 
 
 def test_session_list_returns_json(runner, tmp_path):
@@ -231,6 +232,32 @@ def test_launch_browser_enter_failure_is_json_error_without_launched(
     assert "launched" not in result.output
 
 
+def test_launch_runtime_error_does_not_echo_proxy_credentials_or_tokens(
+    runner, tmp_path, monkeypatch
+):
+    class SensitiveFailureRuntime(FakeRuntime):
+        async def __aenter__(self):
+            raise RuntimeError(
+                "failed proxy=http://alice:proxy-secret@proxy.example "
+                "id_token=fixture-token-value"
+            )
+
+    monkeypatch.setattr(
+        "camoufox.reverse_cli._runtime_factory",
+        lambda: SensitiveFailureRuntime,
+    )
+    result = runner.invoke(
+        cli,
+        ["launch", "--project-dir", str(tmp_path / "p"), "--duration", "0"],
+    )
+
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["error"]["code"] == "runtime_error"
+    assert "proxy-secret" not in result.output
+    assert "fixture-token-value" not in result.output
+
+
 def test_trace_index_rebuilds_session_index(runner, tmp_path):
     session = ReverseProject.open(tmp_path / "p").create_session()
     EvidenceStore(session).append_jsonl("raw/events.jsonl", {"sequence": 1})
@@ -252,6 +279,28 @@ def test_trace_index_rebuilds_session_index(runner, tmp_path):
     assert payload["status"] == "ok"
     assert payload["session_id"] == session.session_id
     assert payload["artifacts"]["index"].endswith(f"{session.session_id}.json")
+
+
+def test_trace_index_reports_incomplete_session_status(runner, tmp_path):
+    session = ReverseProject.open(tmp_path / "p").create_session()
+    session.mark_incomplete()
+
+    result = runner.invoke(
+        cli,
+        [
+            "trace",
+            "index",
+            "--project-dir",
+            str(tmp_path / "p"),
+            "--session",
+            session.session_id,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ok"
+    assert payload["session_status"] == "incomplete"
 
 
 def test_report_build_writes_report_for_indexed_session(runner, tmp_path):

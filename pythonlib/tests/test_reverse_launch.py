@@ -119,6 +119,36 @@ def test_reverse_launch_marks_session_running_after_launch_options(tmp_path, mon
     manifest = json.loads(session.manifest_path.read_text())
     assert manifest["status"] == "running"
     assert manifest["trace_profile"] == "overview"
+    assert manifest["trace_enabled"] is True
+
+
+def test_reverse_launch_records_trace_disabled_in_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr("camoufox.reverse_launch.launch_options", lambda **kwargs: kwargs)
+
+    _, session = reverse_launch_options(project_dir=tmp_path / "p", enable_trace=False)
+
+    assert session.manifest_snapshot()["trace_enabled"] is False
+
+
+def test_resume_rejects_runtime_tmp_symlink_escape(tmp_path, monkeypatch):
+    from camoufox.reverse_project import ReverseProject
+
+    monkeypatch.setattr("camoufox.reverse_launch.launch_options", lambda **kwargs: kwargs)
+    project = ReverseProject.open(tmp_path / "p")
+    session = project.create_session()
+    session.mark_incomplete()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (session.path / "runtime").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="runtime temporary directory"):
+        reverse_launch_options(
+            project_dir=project.path,
+            resume_session=session.session_id,
+        )
+
+    assert not (outside / "tmp").exists()
+    assert session.manifest_snapshot()["status"] == "incomplete"
 
 
 def test_reverse_launch_rejects_unknown_trace_profile(tmp_path, monkeypatch):

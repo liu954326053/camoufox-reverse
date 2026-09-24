@@ -184,6 +184,43 @@ async def test_runtime_closes_entered_browser_when_context_setup_fails(
 
 
 @pytest.mark.asyncio
+async def test_startup_cleanup_cancellation_still_persists_incomplete_manifest(
+    monkeypatch, tmp_path
+):
+    session = FakeSession(tmp_path / "session")
+
+    class FailingContext:
+        @property
+        def pages(self):
+            raise RuntimeError("page setup failed")
+
+    class CancelledCleanupCamoufox(FakeCamoufox):
+        async def __aenter__(self):
+            self.browser = FakeBrowser()
+            self.browser.contexts = [FailingContext()]
+            return self.browser
+
+        async def __aexit__(self, *_args):
+            self.exited = True
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        reverse_runtime,
+        "reverse_launch_options",
+        lambda **kwargs: ({"env": {}}, session),
+    )
+    monkeypatch.setattr(reverse_runtime, "EvidenceStore", lambda value: FakeStore(value))
+    monkeypatch.setattr(reverse_runtime, "AsyncCamoufox", CancelledCleanupCamoufox)
+    runtime = reverse_runtime.AsyncReverseBrowser(tmp_path / "project")
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.__aenter__()
+
+    assert CancelledCleanupCamoufox.instances[-1].exited is True
+    assert session.manifest_snapshot()["status"] == "incomplete"
+
+
+@pytest.mark.asyncio
 async def test_runtime_marks_session_incomplete_when_browser_start_fails(monkeypatch, tmp_path):
     session = FakeSession(tmp_path / "session")
 
@@ -407,6 +444,9 @@ async def test_real_store_failed_index_still_marks_manifest_incomplete(monkeypat
     result = await runtime.close()
     assert result["status"] == "incomplete"
     assert session.manifest_snapshot()["status"] == "incomplete"
+    diagnostics = list((session.raw_dir / "diagnostics").glob("*.jsonl"))
+    assert diagnostics
+    assert any("disk index failed" in path.read_text() for path in diagnostics)
     assert runtime._cm.exited
 
 
@@ -515,6 +555,25 @@ async def test_snapshot_twice_preserves_state_and_per_frame_session_storage(runt
     assert state["sessionStorage"][0]["storage"] == {"key": "first"}
     assert state["sessionStorage"][1]["status"] == "inaccessible"
     assert (await runtime.close())["status"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_skips_session_storage_for_opaque_about_blank_frame(runtime_factory):
+    runtime = await runtime_factory().__aenter__()
+
+    class OpaqueFrame:
+        url = "about:blank"
+
+        async def evaluate(self, _script):
+            raise RuntimeError("The operation is insecure")
+
+    runtime.page.frames = [OpaqueFrame()]
+
+    snapshot = await runtime.snapshot()
+    state = json.loads(Path(snapshot["path"]).read_text())
+
+    assert state["sessionStorage"][0]["status"] == "not_applicable"
+    assert runtime._capture_errors == []
 
 
 @pytest.mark.asyncio
@@ -683,6 +742,42 @@ async def test_native_stop_empty_control_is_unknown_not_zero(runtime_factory):
     result = await runtime.close()
     assert result["status"] == "incomplete"
     assert "native_producers" in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_native_event_count_mismatch_marks_session_incomplete(
+    monkeypatch, tmp_path
+):
+    from camoufox.reverse_project import ReverseProject
+
+    session = ReverseProject.open(tmp_path / "project").create_session()
+    session.mark_running()
+    monkeypatch.setattr(
+        reverse_runtime, "reverse_launch_options", lambda **kwargs: ({}, session)
+    )
+    monkeypatch.setattr(reverse_runtime, "AsyncCamoufox", FakeCamoufox)
+    runtime = await reverse_runtime.AsyncReverseBrowser(
+        tmp_path / "project", enable_trace=True
+    ).__aenter__()
+
+    command, status, trace = native_process(session.trace_dir, 401)
+    status.write_text("off 0 events=2 dropped=0\n")
+    Path(str(trace) + ".meta.json").write_text(
+        '{"state":"off","session_id":0,"events":2,"dropped":0}\n'
+    )
+
+    result = await runtime.close()
+
+    assert command.read_text().strip() == "off"
+    assert result["status"] == "incomplete"
+    assert session.manifest_snapshot()["status"] == "incomplete"
+    index = json.loads(Path(result["artifacts"]["index"]).read_text())
+    assert index["event_loss"] == 1
+    assert index["event_loss_complete"] is False
+    assert {
+        "source_path": "trace/traces/401_0.jsonl",
+        "reason": "native_event_count_mismatch",
+    } in index["event_loss_gaps"]
 
 
 @pytest.mark.asyncio

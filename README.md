@@ -1,867 +1,208 @@
-<img src="https://camoufox.com/static/banner.svg" align="center">
+# Camoufox Reverse
 
-<h1 align="center">Camoufox</h1>
+Camoufox Reverse 是一个面向 Web 协议、混淆脚本、动态代码和 JavaScript 虚拟机分析的浏览器基础平台。它在 Camoufox 的 Gecko 层提供可选的 PropertyTracer，并把网络、脚本、Cookie、Storage、环境访问和执行事件保存到指定工程目录，供后续分析器建立调用链和值生成链。
 
-<h4 align="center">Camoufox is an open source anti-detect browser built for webscraping & AI agents. 🦊</h4>
+本项目只提供逆向分析基础设施，不把任何具体站点逻辑写死在浏览器核心中。Google 登录、验证码、BotGuard 或其它第三方认证流程不会由本项目自动填写账号、绕过防护或收集凭据；真实目标分析必须在获得授权的前提下由使用者主动操作。
 
-<div align="center">
-  <a href="https://trendshift.io/repositories/12224" target="_blank">
-    <img src="https://trendshift.io/api/badge/repositories/12224" alt="daijro%2Fcamoufox | Trendshift" width="250" height="55"/>
-  </a><br>
-  <a href="https://pepy.tech/projects/camoufox"><img src="https://static.pepy.tech/personalized-badge/camoufox?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="Total Downloads"</a>
-  <a href="https://pepy.tech/projects/camoufox"><img src="https://static.pepy.tech/personalized-badge/camoufox?period=monthly&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads%2Fmonth" alt="Monthly Downloads"></a>
-    <a href="https://pepy.tech/projects/camoufox"><img src="https://static.pepy.tech/personalized-badge/camoufox?period=weekly&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads%2Fweek" alt="Weekly Downloads"></a>
-<h4>⚠️ This project is under development. It may not be suitable for stable production use. ⚠️</h4>
-</div>
+## 当前状态
 
----
+已实现并验证的基础能力：
 
-> [!NOTE]
-> **All of the latest documentation is available at [camoufox.com](https://camoufox.com).**
+- 必填的 `project_dir` 和工程目录权限校验；
+- 每次启动创建独立 `session_id`，显式 `resume_session` 才能恢复未完成 session；
+- 原始网络、脚本、状态、截图和 trace 追加写入 session 的 `raw/` 或 `trace/`；
+- raw 文件索引重建、事件丢失计数和异常退出后的 `incomplete` 状态；
+- Python 启动 API、`reverse-browser` CLI 和独立 MCP 适配器共用同一套工程/session 核心；
+- MCP/CLI 的路径 containment、关闭幂等、错误 envelope 和敏感值不回显；
+- 随项目提供的中文 Agent Skill 与 Python MCP stdio client。
 
----
+深层 SpiderMonkey 全量 opcode、VM 寄存器适配器、浏览器与 Go 实现的首个分歧定位仍属于后续计划。通过基础测试不等于某个第三方站点登录成功。
 
-## Camoufox Reverse — PropertyTracer build
-
-This fork keeps upstream Camoufox unchanged by default and publishes a separate,
-opt-in browser build with a native Gecko DOM/Web API `PropertyTracer`. The
-current Firefox 152 build is based on upstream `v152.0.4-beta.30`, preserves the
-Firefox 135 JSONL/control contract, and covers 77 fingerprint-relevant native
-injection sites.
-
-`reverse.5` keeps the `reverse.4` correctness and isolation improvements while
-moving the two `localStorage` hooks from Firefox's disabled-by-default,
-unsupported legacy implementation to the Firefox 152 LSNG `LSObject` path and
-covering the separate, default-reachable `PartitionedLocalStorage` branch with
-two additional native sites. The hook count is 77; the protocol-v1
-event/control contract is unchanged. The baseline includes correct
-get/set/call classification, native source-site IDs, per-process sequence
-numbers, mergeable wall-clock microseconds, exclusive session files, and
-buffered short-write-safe I/O. It does not rewrite page JavaScript objects,
-descriptors, or prototypes. High-volume native tracing can still affect timing,
-so it remains explicitly opt-in and capped.
-
-- Normal Camoufox users should continue using the upstream `official/stable`
-  channel.
-- The reverse build is required only for
-  `camoufox-reverse-mcp.trace_property_access`.
-- Existing Firefox 135 installations are not migrated, overwritten, or selected
-  automatically.
-
-### Side-by-side installation with Camoufox Python 0.5+
-
-The current reverse build is based on the upstream `152.0.4-beta.30`
-prerelease. MCP v1.4.0 intentionally requires the active official browser and
-the selected reverse browser to have the same complete version/build, so first
-install and pin that exact official build:
-
-```bash
-camoufox fetch official/prerelease/152.0.4-beta.30
-camoufox set official/prerelease/152.0.4-beta.30
-camoufox active
-```
-
-The first command asks for confirmation because beta.30 is an upstream
-prerelease. The MCP never changes this setting itself.
-
-1. Download the archive for your platform from the exact
-   [reverse.5 release](https://github.com/WhiteNightShadow/camoufox-reverse/releases/tag/v152.0.4-beta.30-reverse.5).
-2. Download `install-camoufox-reverse.py` from that release and install the
-   checked archive without changing active config:
-
-```bash
-python3 install-camoufox-reverse.py camoufox-152.0.4-beta.30-<platform>.zip \
-  --sha256 <value-from-SHA256SUMS>
-```
-
-The installer refuses legacy flat-cache migration and places the build under
-`browsers/whitenightshadow/152.0.4-beta.30-reverse.5/`.
-Use the provided installer rather than a bare archive extraction: cross-built
-zip files do not reliably preserve executable mode bits, while the installer
-normalizes them before the browser is selected.
-3. Keep the official browser active. Select the reverse build only for one MCP
-   launch:
+## 目录结构
 
 ```text
-launch_browser(
-  browser_version="whitenightshadow/152.0.4-beta.30-reverse.5",
-  enable_trace=True
-)
+project/
+├── project.json
+├── runs/
+│   └── <session-id>/
+│       ├── manifest.json
+│       ├── raw/
+│       ├── trace/
+│       ├── derived/
+│       └── report/
+└── indexes/
 ```
 
-`enable_trace=True` uses a private run directory and temporarily disables the
-Firefox content sandbox so content processes can write the trace. Keep trace
-sessions short and close the browser after analysis. Normal launches retain the
-upstream sandbox and behavior.
+`raw/` 和 `trace/` 保存完整原始数据，不做脱敏、截断或有损转换；`derived/`、`report/` 和 `indexes/` 只保存索引与派生结果。工程目录应视为敏感数据目录，不要把它提交到 Git 或上传到第三方服务。
 
-Run `check_environment()` to list the exact installed selector. Camoufox Python
-0.4.x keeps its existing flat-cache behavior; omit `browser_version` to preserve
-that path. Do not clear or overwrite a Camoufox 0.5 cache root. The previous
-`reverse.2`, `reverse.3`, and `reverse.4` remain supported; no existing
-installation must migrate.
+## 安装 Python 核心
 
-> 中文说明：152 定制版与官方版并存，默认仍走官方/当前 active 版本；只有显式传
-> `browser_version` 才会启动 PropertyTracer 版本，因此不会影响现有 135 用户。
+要求 Python 3.10 或更高版本。纯 browser-free 测试不需要启动浏览器：
 
----
+```bash
+cd pythonlib
+python3 -m pip install -e .
+```
 
-### Local reverse-browser smoke check
+安装后会提供 `reverse-browser` 命令。普通 Camoufox 的已有安装和 active 版本不会被自动切换。
 
-The foundation can be checked locally without navigating a target site. Install
-the `reverse-browser` entry point, keep the local proxy available, and launch a
-short targeted session:
+### 安装 PropertyTracer 浏览器
+
+需要原生 trace 时，安装与当前 Python 包匹配的 reverse 构建。当前 selector 是：
+
+```text
+whitenightshadow/152.0.4-beta.30-reverse.5
+```
+
+请从对应 release 下载与你的平台匹配的归档，并使用 release 附带的安装器校验 SHA-256 后安装。不要把 reverse 构建解压到普通缓存目录，也不要覆盖已有 active 版本。安装完成后可检查：
+
+```bash
+python3 -m camoufox list
+python3 -m camoufox active
+```
+
+普通 Camoufox 和 reverse 构建可以并存；只有显式传入 `--browser-version` 时才会选择 reverse 构建。
+
+## CLI 使用
+
+启动时 `--project-dir` 必填。按本机约定使用 `127.0.0.1:7890` 代理时：
 
 ```bash
 reverse-browser launch \
   --project-dir /absolute/path/to/project \
   --proxy http://127.0.0.1:7890 \
   --browser-version whitenightshadow/152.0.4-beta.30-reverse.5 \
-  --trace-profile targeted
+  --trace-profile targeted \
+  --headless \
+  --url about:blank \
+  --duration 5
 ```
 
-The command prints the project-scoped `session_id`, manifest, session directory,
-and trace directory. Acceptance should inspect
-`runs/<session_id>/manifest.json`, confirm raw trace files are present under the
-session, run the index rebuild, and verify that a forced initialization failure
-leaves an `incomplete` session that can be resumed. The browser-free regression
-suite is:
+不需要原生 trace 时可以加 `--no-trace`。不提供 `--duration` 时，命令会持续运行，收到 `SIGINT` 或 `SIGTERM` 后关闭 session。
+
+查询 session、重建索引和生成报告：
+
+```bash
+reverse-browser session list \
+  --project-dir /absolute/path/to/project
+
+reverse-browser trace index \
+  --project-dir /absolute/path/to/project \
+  --session <session-id>
+
+reverse-browser report build \
+  --project-dir /absolute/path/to/project \
+  --session <session-id>
+```
+
+CLI 输出为 JSON。错误输出不会回显代理密码、Cookie、token 或异常原文中的敏感值。
+
+## MCP 服务器
+
+MCP 服务器位于独立仓库 `camoufox-reverse-mcp`，它是本项目 Python 核心的薄适配层，不复制工程/session 实现。安装该服务器后，使用绝对工程目录启动：
+
+```bash
+cd /path/to/camoufox-reverse-mcp
+python3 -m pip install -e .
+camoufox-reverse-mcp \
+  --project-dir /absolute/path/to/project \
+  --proxy http://127.0.0.1:7890 \
+  --headless
+```
+
+MCP 的 `launch_browser` 要求 `project_dir`，默认捕获模式是 `raw`。核心工具包括浏览器启停、页面导航、网络请求、脚本保存、状态导出、PropertyTracer、动态脚本 instrumentation 和 session 文件查询。所有返回的 artifact 路径都必须位于当前 session 目录内。
+
+MCP 契约见 [`docs/reverse-browser-mcp-contract.md`](docs/reverse-browser-mcp-contract.md)。独立 MCP client 位于 `integrations/camoufox-reverse-mcp-client/`，只使用 Python 标准库，通过 MCP stdio JSON Lines 协议连接服务器，不依赖 Node、浏览器或 JavaScript：
+
+```bash
+cd integrations/camoufox-reverse-mcp-client
+python3 -m pip install -e .
+python3 -m camoufox_reverse_mcp_client \
+  --command camoufox-reverse-mcp \
+  --project-dir /absolute/path/to/project \
+  --proxy http://127.0.0.1:7890 \
+  list-tools
+```
+
+## Agent Skill
+
+中文 Skill 位于 `integrations/camoufox-reverse-skill/SKILL.md`。它规定了工程目录、session 隔离、原始证据、MCP/CLI 调用和安全边界，可复制到 `$CODEX_HOME/skills/camoufox-reverse-browser/` 或其它兼容 Agent 的 skill 目录。安装脚本默认只复制到指定 skill 目录，不修改宿主全局 MCP 配置：
+
+```bash
+python3 scripts/install_reverse_browser_agent.py \
+  --project-dir /absolute/path/to/project \
+  --apply
+```
+
+脚本默认是 dry-run，不创建目标目录。需要生成 MCP 配置示例时显式指定输出路径并使用 `--apply`：
+
+```bash
+python3 scripts/install_reverse_browser_agent.py \
+  --project-dir /absolute/path/to/project \
+  --mcp-config /absolute/path/to/project/mcp-config.json \
+  --apply
+```
+
+配置示例只包含命令、工程目录和代理地址，不包含密码、Cookie 或 token。脚本不会自动启动浏览器，不会访问网络，也不会覆盖已有配置，除非显式使用 `--force`。
+
+### 发给 Agent 的自动安装消息
+
+下面这段消息可以直接发送给支持本地命令执行的 Agent。它要求 Agent 只在当前仓库安装本项目附带的 Skill 和 MCP client，并先检查路径：
+
+```text
+请在当前 Camoufox Reverse 仓库中安装本项目附带的逆向分析能力：
+
+1. 先确认当前目录包含 integrations/camoufox-reverse-skill、integrations/camoufox-reverse-mcp-client 和 scripts/install_reverse_browser_agent.py。
+2. 使用 Python 3.10+ 执行：
+   python3 scripts/install_reverse_browser_agent.py --project-dir /absolute/path/to/project --apply
+3. 在 integrations/camoufox-reverse-mcp-client 中执行 python3 -m pip install -e .；不要安装 Node、浏览器自动化脚本或 JavaScript 运行时。
+4. 按脚本输出把 camoufox-reverse MCP 服务器注册到当前 Agent 的 MCP 配置；配置必须使用绝对 project_dir，并使用 http://127.0.0.1:7890 作为代理地址。
+5. 安装完成后只做 browser-free 校验：读取 Skill、执行 MCP client 的 list-tools 或 --help，并确认没有输出密码、Cookie、token；不要登录第三方网站、不要处理验证码、不要绕过认证或风控。
+6. 报告实际修改的文件、安装路径和校验命令；不要把工程目录或 raw 证据加入 Git。
+```
+
+## 安全边界
+
+- 所有原始证据默认包含敏感数据，工程目录权限默认限制为当前用户；
+- 不上传、不遥测、不自动提交 Git；
+- 不在 stdout/stderr 打印密码、Cookie、token 或代理认证信息；
+- 不使用 browser profile 复用未显式指定的旧 session；
+- 不自动填写第三方账号，不绕过验证码、登录挑战或风控；
+- 仅在获得目标授权时分析目标页面和网络流量。
+
+## 测试
+
+Python 核心 browser-free 测试：
 
 ```bash
 cd pythonlib
-python -m pytest tests/test_reverse_integration.py -q
+python3 -m pytest -q
 ```
 
-This smoke check validates local launch, storage, containment, and recovery
-boundaries. It does not claim Google navigation or Google end-to-end success.
-
----
-
-# Sponsors
-
-<details open>
-<summary>View/Collapse All</summary>
-
-## Premium
-
-<table>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/daijrogh" target="_blank">
-        <img width="380" alt="nodemaven" src="https://github.com/user-attachments/assets/25015cb5-f1b4-4b49-9e9b-b74dc25037dc"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://go.nodemaven.com/daijrogh">NodeMaven</a>: The most efficient proxy provider for Web Scrapping and Automation with the Highest Quality IP on the market.<br>
-      <strong>Why <a href="https://go.nodemaven.com/daijrogh">NodeMaven</a>?</strong><br>
-      • 99.9% uptime<br>
-      • ZIP Targeting<br>
-      • IP filtering: all proxies have fraud score <97%<br>
-      • No KYC required<br>
-      • Unique free tools: Proxy Bandwidth Checker, Meta Tag Checker, IP Lookup and others!<br>
-      <strong>Special codes for Camoufox users:</strong><br>
-      • <code>CAMOUFOX35</code> - 35% off to Mobile and Residential Proxies<br>
-      • <code>CAMOUFOX40</code> - 40% off to ISP (Static) Proxies<br>
-    </td>
-  </tr>
-</table>
-
-## Tools & Services
-  
-<table>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://scrapfly.io/?utm_source=github&utm_medium=sponsoring&utm_campaign=camoufox" target="_blank">
-        <img src="https://raw.githubusercontent.com/daijro/camoufox/main/assets/scrapfly.png" alt="Scrapfly.io" width="200">
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://scrapfly.io/?utm_source=github&utm_medium=sponsoring&utm_campaign=camoufox">Scrapfly</a> is an enterprise-grade solution providing Web Scraping API that aims to simplify the scraping process by managing everything: real browser rendering, rotating proxies, and fingerprints (TLS, HTTP, browser) to bypass all major anti-bots. Scrapfly also unlocks the observability by providing an analytical dashboard and measuring the success rate/block rate in detail.
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://cloverlabs.ai/?utm_source=github&utm_medium=sponsoring&utm_campaign=camoufox" target="_blank">
-        <img src="https://i.imgur.com/I3oe7xG.jpeg" alt="cloverlabs.ai" width="300">
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://cloverlabs.ai/?utm_source=github&utm_medium=sponsoring&utm_campaign=camoufox">Clover Labs</a> is a Toronto based venture studio building AI agents for growth and distribution.
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle" height="100">
-      <a href="https://serpapi.com/use-cases/web-search-api?utm_source=camoufox" target="_blank">
-        <img width="350" alt="color horizontal" src="https://github.com/user-attachments/assets/cdf90178-869e-4f85-8288-3fe32da319d9"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://serpapi.com/use-cases/web-search-api?utm_source=camoufox">SerpApi, a web search API</a> to scrape Google and other search engines with a simple API.
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle" height="100">
-      <a href="https://crawlbase.com/?utm_source=github&utm_medium=sponsorship&utm_campaign=camoufox" target="_blank">
-        <img width="350" alt="color horizontal" src="https://github.com/user-attachments/assets/5c515090-86c2-4c76-b7b2-6e0b393594d5"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <strong>Web data that survives the anti-bots.</strong><br>
-      <a href="https://crawlbase.com/?utm_source=github&utm_medium=sponsorship&utm_campaign=camoufox">Crawlbase</a> gives developers and AI teams reliable data at scale: a 99% success-rate Crawler, Crawling API, Smart AI Proxies, and Web MCP Server that get through, so your scrapers and agents don't break. You build, we handle the infrastructure.
-
-<strong>Get 15% off your first 3 months with code CAMOUFOX</strong> → <a href="https://crawlbase.com/?utm_source=github&utm_medium=sponsorship&utm_campaign=camoufox">crawlbase.com</a>
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://scrappey.com/?utm_source=camoufox&utm_medium=sponsorship&utm_campaign=camoufox_sponsorship" target="_blank">
-        <img width="380" alt="scrappey" src="https://github.com/user-attachments/assets/11b51db9-29c2-4ae9-a568-7466a5941c96"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://scrappey.com/?utm_source=camoufox&utm_medium=sponsorship&utm_campaign=camoufox_sponsorship">Scrappey</a> is a Web Scraping API that only charges successful scrapes with pay as you go - no subscriptions. Scrape complex sites. Residential proxies included, no hidden proxy fees, or expiring balances. One API for direct HTTP, full-browser rendering, JavaScript-heavy pages, screenshots, sessions, 30+ browser actions and 200+ concurrent sessions at a time - trusted by 1000+ developers and AI agents. Get 10% off with code CAMOUFOX.
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://cloro.dev/?utm_source=referral&utm_medium=camoufox" target="_blank">
-        <img width="380" alt="Cloro" src="https://github.com/user-attachments/assets/6dce6615-9733-43e3-8c6d-8d3bfb1aa7c7" />
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://cloro.dev/?utm_source=referral&utm_medium=camoufox">Cloro</a> is a SERP and AI search API. Get structured results from Google, ChatGPT, Perplexity, Gemini, Copilot and Grok.
-    </td>
-  </tr>
-</table>
-
-## Proxy Providers
-
-Camoufox is intended to be used with rotating proxies (preferably residential IPs). Check out these providers:
-
-<table>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://proxyempire.io/?ref=camoufox&utm_source=github&utm_medium=paid_referral&utm_campaign=open_source_sponsorship&utm_content=camoufox" target="_blank">
-        <img width="380" alt="proxyempire" src="https://github.com/user-attachments/assets/d1c5f849-5cb0-4aff-b48c-530bda2ee03f"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <b>🚀 Camoufox × ProxyEmpire</b><br>
-      Running Camoufox? Your proxy layer decides whether you scale — or get blocked.<br>
-      <a href="https://proxyempire.io/?ref=camoufox&utm_source=github&utm_medium=paid_referral&utm_campaign=open_source_sponsorship&utm_content=camoufox">ProxyEmpire</a> delivers:<br>
-      • 🌍 30M+ Residential IPs (170+ countries)<br>
-      • 📱 4G/5G Mobile Proxies<br>
-      • 🔄 Rotating & Sticky Sessions<br>
-      • ⚡ Unlimited Concurrent Sessions<br>
-      • 🎯 Precise geo-targeting<br>
-      • HTTP, HTTPS & SOCKS5 Support<br>
-      Built for scraping, automation, and high-stealth workflows.<br>
-      <b>🔥 Exclusive Offer</b> - Use code <b>Camoufox30</b><br>
-      Get <b>30% recurring discount</b> (not just first month). Upgrade your proxies. Reduce bans. Scale properly
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://www.rapidproxy.io/?ref=daijro" target="_blank">
-        <img width="380" alt="rapidproxy" src="https://github.com/user-attachments/assets/140337e0-50d5-452d-8a31-86c6b1761e47"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://www.rapidproxy.io/?ref=daijro">RapidProxy</a> - Power Your Data with Premium Proxies.<br>
-      🎁 Try proxies for free  + Use code <strong>RAPID10</strong> for <strong>10% OFF</strong>
-      <br>
-      <strong>Why Choose RapidProxy?</strong><br>
-      • 🌍 90M+ IPs in 200+ countries & regions<br>
-      • ♾️ No expiration on traffic — use anytime, no pressure<br>
-      • 🔥 Unlimited concurrency for maximum performance<br>
-      • 💰 Starting from just &#36;0.65/GB — built for scale<br>
-      • 📍 City-level targeting for precise geo access<br>
-      • 🔄 Flexible session control tailored to your needs<br>
-      Don’t miss out — start your free trial today and experience fast, stable, and scalable proxy performance with <a href="https://www.rapidproxy.io/?ref=daijro">RapidProxy</a>.
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://www.swiftproxy.net/?ref=daijro" target="_blank">
-        <img width="380" alt="swiftproxy" src="https://github.com/user-attachments/assets/2f351c5e-f128-4478-83ff-46a261bea221"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://www.swiftproxy.net/?ref=daijro">Swiftproxy</a> - <strong>High-Performance Residential Proxies for Scalable Data Collection</strong><br>
-      Built for developers who need <strong>reliable</strong>, anti-detection proxy infrastructure. Swiftproxy delivers stable connections, high success rates, and flexible control for large-scale scraping and automation.<br>
-      • 🌍 195+ locations with ethically sourced residential IPs<br>
-      • 🔄 <strong>Rotating</strong> & <strong>sticky</strong> sessions with precise geo-targeting<br>
-      • ⚡ Optimized for <strong>anti-ban</strong> & <strong>high success rate</strong><br>
-      • 🔌 HTTP / HTTPS / SOCKS5 support<br>
-      • 🧪 <strong>Free 500MB trial</strong> for testing<br>
-      • 💸 <strong>Special discount</strong> code for Camoufox users: <strong>PROXY90 - 10%</strong><br>
-      Best for: Web scraping, automation, multi-accounting, and large-scale data extraction
-    </td>
-  </tr>     
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://mangoproxy.com/?utm_source=github&utm_medium=partner&utm_campaign=daijro" target="_blank">
-        <img width="380" alt="mangoproxy" src="https://github.com/user-attachments/assets/c2cd3ddf-c940-4906-be1b-5505dcdb6e06"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <a href="https://mangoproxy.com/?utm_source=github&utm_medium=partner&utm_campaign=daijro">MangoProxy</a> is a Residential, ISP, Mobile and Datacenter proxy service designed for professional tasks where stability, speed, and anonymity matter.<br>
-      Use code DAIJRO for 8% OFF ISP Static Proxies
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://proxidize.com/?utm_source=github&utm_medium=sponsorship&utm_campaign=camoufox&utm_content=daijro" target="_blank">
-        <img width="380" alt="proxidize" src="https://imagedelivery.net/r4caA8hJ3Ww3j8uyC_NNCA/95a9137a-43fd-48d4-7243-983f3f4a3d00/public"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <strong><a href="https://proxidize.com/?utm_source=github&utm_medium=sponsorship&utm_campaign=camoufox&utm_content=daijro">Proxidize</a> | Mobile and Residential Proxies for Camoufox</strong><br>
-      Running Camoufox at scale? Your browser setup is only half the stack. Your proxy layer matters too.<br>
-      Proxidize provides mobile and residential proxies built for scraping, browser automation, SEO monitoring, AI agents, and data collection workflows.<br>
-      <strong>Why Proxidize?</strong><br>
-      • Real 4G and 5G mobile proxies<br>
-      • Residential proxies in 195+ countries<br>
-      • Rotating and sticky sessions<br>
-      • City-level and carrier targeting<br>
-      • Unlimited concurrency<br>
-      • HTTP(S), SOCKS5, and UDP over SOCKS support<br>
-      • No hardware or DIY setup required<br>
-      Built for teams that need reliable proxy infrastructure without managing devices, servers, or proxy rotation themselves.<br>
-      <strong>Special offer for Camoufox users</strong>: Use code <strong>CAMOUFOX20</strong> for <strong>20% off</strong>.<br>
-      Start now: <a href="https://proxidize.com/?utm_source=github&utm_medium=sponsorship&utm_campaign=camoufox&utm_content=daijro">https://proxidize.com</a>
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://niuproxy.com/?utm_source=camoufox&utm_medium=camoufox&ref=camoufox" target="_blank">
-        <img width="380" alt="NiuProxy" src="https://github.com/user-attachments/assets/d1fc12cc-4113-4a8e-a7d3-e34df6c93731"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <strong><a href="https://niuproxy.com/?utm_source=camoufox&utm_medium=camoufox&ref=camoufox">NiuProxy</a> | Rotating Residential Proxies from &#36;0.35/GB<br></strong>
-      NiuProxy provides residential, ISP, mobile, and datacenter proxies for scraping, browser automation, SEO, AI agents, and data collection.<br>
-      <strong>Why NiuProxy?</strong><br>
-      • Residential proxies from &#36;0.35/GB<br>
-      • ISP proxies from &#36;3/IP<br>
-      • Mobile proxies from &#36;1.5/GB<br>
-      • Datacenter proxies from &#36;0.5/GB<br>
-      • HTTP(S) & SOCKS5 support<br>
-      • Flexible geo targeting and sessions<br>
-      • Alipay, USDT, cards, Google Pay & Apple Pay<br>
-      Special offer for Camoufox users: Use code PAY2 for 10% off your recharge.<br>
-      Start now: <a href="https://niuproxy.com/?utm_source=camoufox&utm_medium=camoufox&ref=camoufox">https://niuproxy.com</a>
-    </td>
-  </tr>
-  <tr>
-    <td width="25%" align="center" valign="middle">
-      <a href="https://www.thordata.com/?ls=dcx&lk=dcx" target="_blank">
-        <img width="380" alt="Thordata" src="https://github.com/user-attachments/assets/0476bd5a-0063-4c31-8dc2-d3f982d58e6c"/>
-      </a>
-    </td>
-    <td valign="middle">
-      <b>🔍 Camoufox × Thordata</b><br>
-      <b>Real Residential IPs for Smarter AI Agents & Automation</b><br>
-      With <strong>100M+ residential IPs</strong>, Thordata helps your scraper access the web through real user IPs across <strong>195+ countries</strong>.<br>
-      Target specific locations with precision — including <strong>city, ISP, and ASN-level targeting</strong> — so your Camoufox automation runs with a more authentic network identity.<br>
-      • 🔄 <strong>Rotating & Sticky Sessions</strong> (up to 90 minutes)<br>
-      • ⚡ <strong>99.99% uptime</strong> with unlimited concurrent sessions<br>
-      • 🌍 <strong>Global residential coverage</strong> for AI agents, scraping, and automation workflows<br>
-      🎁 <strong>Exclusive for Camoufox users:</strong><br>
-      Get free trial traffic after signup + use code <strong>Camoufox</strong> for <strong>10% OFF</strong>.<br>
-      <a href="https://www.thordata.com/?ls=dcx&lk=dcx" target="_blank">Start your free trial with Thordata</a>
-  </tr>
-</table>
-</details>
-
----
-
-# Introduction
-
-Camoufox is a Firefox fork engineered for web scraping and AI agents. It is headless, undetectable, and optimized to run at scale. Every run gets a fresh identity drawn from the real-world distribution of devices, so it blends into normal traffic instead of standing out.
-
-## Highlights
-
-* **Built for AI agents** 🤖
-  * Minimal, debloated Firefox - fast to launch, cheap to run
-  * Drop-in Playwright compatibility via Python interface
-  * Invisible to anti-bot systems so you can run your agent cluster locally or in the cloud without being flagged
-
-- **Undetectable by design** 🎭
-  - Page automation hidden from JavaScript inspection. See the [stealth page](https://camoufox.com/stealth) for more details.
-
-* **Fingerprint injection & rotation (without JS injection!)**
-  * All navigator properties (device, OS, hardware, browser, etc.) ✅
-  * Screen size, resolution, window, & viewport properties ✅
-  * Geolocation, timezone, locale, & Intl spoofing ✅
-  * WebRTC IP spoofing at the protocol level ✅
-  * Voices, speech playback rate, etc. ✅
-  * And much, much more!
-
-- **Anti Graphical fingerprinting**
-  - WebGL parameters, supported extensions, context attributes, & shader precision formats ✅
-  - Font spoofing & anti-fingerprinting ✅
-
-* **Optimized for automation**
-  * Human-like mouse movement 🖱️
-  * Blocks & circumvents ads 🛡️
-  * No CSS animations 💨
-
-- Debloated & optimized for memory efficiency ⚡
-- [PyPi package](https://pypi.org/project/camoufox/) for updates & auto fingerprint injection 📦
-- Stays up to date with the latest Firefox version 🕓
-
----
-
-## Fingerprint Injection
-
-In Camoufox, data is intercepted at the C++ implementation level, making the changes undetectable through JavaScript inspection.
-
-To spoof individual fingerprint properties, pass a JSON containing properties to spoof to the [Python interface](https://github.com/daijro/camoufox/tree/main/pythonlib#camoufox-python-interface):
-
-```py
->>> with Camoufox(config={"property": "value"}) as browser:
-```
-
-Config data not set by the user will be automatically populated using [BrowserForge](https://github.com/daijro/browserforge) fingerprints, which mimic the statistical distribution of device characteristics in real-world traffic.
-
-[[See implemented properties](https://camoufox.com/fingerprint/)]
-
----
-
-## Python Usage
-
-Camoufox is compatible with your existing Playwright code. You only have to change your browser initialization.
-
-**Sync API**
-
-```python
-from camoufox.sync_api import Camoufox
-
-with Camoufox() as browser:
-    page = browser.new_page()
-    page.goto("https://example.com")
-```
-
-**Async API**
-
-```python
-from camoufox.async_api import AsyncCamoufox
-
-async with AsyncCamoufox() as browser:
-    page = await browser.new_page()
-    await page.goto("https://example.com")
-```
-
-[[Installation & usage](https://camoufox.com/python/)]
-
----
-
-## Capabilities
-
-Below is a list of patches and features implemented in Camoufox.
-
-### Fingerprint spoofing
-
-- Navigator properties spoofing (device, browser, locale, etc.)
-- Support for emulating screen size, resolution, etc.
-- Spoof WebGL parameters, supported extensions, context attributes, and shader precision formats.
-- Spoof inner and outer window viewport sizes
-- Spoof AudioContext sample rate, output latency, and max channel count
-- Spoof device voices & playback rates
-- Spoof the amount of microphones, webcams, and speakers available.
-- Network headers (Accept-Languages and User-Agent) are spoofed to match the navigator properties
-- WebRTC IP spoofing at the protocol level
-- Geolocation, timezone, and locale spoofing
-- Battery API spoofing
-- etc.
-
-### Stealth patches
-
-- Avoids main world execution leaks. All page agent javascript is sandboxed
-- Avoids frame execution context leaks
-- Fixes `navigator.webdriver` detection
-- Fixes Firefox headless detection via pointer type ([#26](https://github.com/daijro/camoufox/issues/26))
-- Removed potentially leaking anti-zoom/meta viewport handling patches
-- Uses non-default screen & window sizes
-- Re-enable fission content isolations
-- Re-enable PDF.js
-- Other leaking config properties changed
-- Human-like cursor movement
-
-### Anti font fingerprinting
-
-- Automatically uses the correct system fonts for your User Agent
-- Bundled with Windows, Mac, and Linux system fonts
-- Prevents font metrics fingerprinting by randomly offsetting letter spacing
-
-### Playwright support
-
-- Custom implementation of Playwright for the latest Firefox
-- Various config patches to evade bot detection
-
-### Debloat/Optimizations
-
-- Stripped out/disabled _many, many_ Mozilla services. Runs faster than the original Mozilla Firefox, and uses less memory (200mb)
-- Patches from LibreWolf & Ghostery to help remove telemetry & bloat
-- Debloat config from PeskyFox, LibreWolf, and others
-- Speed & network optimizations from FastFox
-- Removed all CSS animations
-- Minimalistic theming
-- etc.
-
-### Addons
-
-- Load Firefox addons without a debug server by passing a list of paths to the `addons` property
-- Added uBlock Origin with custom privacy filters
-- Addons are not allowed to open tabs
-- Addons are automatically enabled in Private Browsing mode
-- Addons are automatically pinned to the toolbar
-- Fixes DNS leaks with uBO prefetching
-
-### Python Interface
-
-- Automatically generates & injects unique device characteristics into Camoufox based on their real-world distribution
-- WebGL fingerprint injection & rotation
-- Uses the correct system fonts and subpixel antialiasing & hinting based on your target OS
-- Avoid proxy detection by calculating your target geolocation, timezone, & locale from your proxy's target region
-- Calculate and spoof the browser's language based on the distribution of language speakers in the proxy's target region
-- Remote server hosting to use Camoufox with other languages that support Playwright
-- Built-in virtual display buffer to run Camoufox headfully on a headless server
-- Toggle image loading, WebRTC, and WebGL
-- etc.
-
-> [!NOTE]
-> Camoufox does **not** fully support injecting Chromium fingerprints. Some WAFs (such as [Interstitial](https://nopecha.com/demo/cloudflare)) test for Spidermonkey engine behavior, which is impossible to spoof.
-
----
-
-# Stealth Overview
-
-## How Camoufox hides its automation library
-
-> [!WARNING]
-> **Current status as of 2026**:
-> There has been a year gap in maintenance due to a personal situation. Camoufox has gone down in performance due to the base Firefox version and newly discovered fingerprint inconsistencies. **Camoufox is currently under active development.**
-
-In Camoufox, all of Playwright's internal Page Agent's code is sandboxed and isolated. This makes it impossible for a page to detect the presence of Playwright through Javascript inspection.
-
-Normally, Playwright injects some JavaScript into the page such as `window.__playwright__binding__` and to perform actions like querying elements, evaluating javascript, or running init scripts, which can be detected by websites. In Camoufox, these actions are handled in an isolated scope outside of the page. In other words, websites can no longer "see" any JavaScript that Playwright would typically inject. This prevents traces of Playwright altogether.
-
-However, even with hiding its automation library, Camoufox is not immune to inconsistencies in fingerprint rotation. This still requires maintenance to spot and fix.
-
-### Page Interactions
-
-Anti-bot systems also run client-side scripts to monitor your behavior. For example, they look for patterns in mouse movements, clicks, scrolling, and the timing between actions.
-
-<video src="https://github.com/user-attachments/assets/6d33d6af-3537-4603-bf24-6bd3f4f8f455" width="200px" autoplay loop muted></video>
-
-Camoufox tries its best with its human-like mouse movement algorithm. The natural motion algorithm was originally from [riflosnake's HumanCursor](https://github.com/riflosnake/HumanCursor) and has been rewritten in C++ and modified for more distance-aware trajectories.
-
-However, this isn't perfect. It may still be detected with sophisticated enough analysis. (WIP for the future)
-
----
-
-## How Camoufox rotates identities
-
-AI agents need to operate across many sessions without getting flagged or rate-limited. Rotating your IP address isn't enough — every browser session carries thousands of signals that create a unique **fingerprint**. A website can see your OS, GPU, screen resolution, fonts, timezone, and more. If those signals are inconsistent or unusual, you get blocked.
-
-### Market Share Distribution
-
-Even if you are rotating your IP for each running bot instance, web access firewalls can still use machine learning to analyze incoming web traffic to detect if it's abnormal. If the Linux market share was 5%, then suddenly it's 20%, it's a red flag. They will unconditionally require all Linux users to complete a captcha.
-
-Camoufox uses [BrowserForge](https://github.com/daijro/browserforge)'s fingerprint generator to mimic the statistical distribution of device data in real-world traffic. For example, Camoufox will make your browser look like a Linux user 5% of the time. Of that 5%, it will spoof a 2560x1440 screen resolution 9.5% of the time and an Intel HD GPU 27.5% of the time.
-
-### How can Camoufox be detected?
-
-Camoufox can spoof fingerprints with a correct market share. However, **fingerprints must also be internally consistent.** A Windows user agent with an Apple M1 GPU, a MacOS user agent with a Windows DirectX renderer, and a mobile device with a desktop screen resolution are all impossible, and will be flagged for being suspicious.
-
-Of the thousands of possible datapoints that must be changed to create a believable spoofed fingerprint, where each change must be consistent with the others, Camoufox doesn't always succeed. Anti-bot providers test Camoufox over and over again to find even 1 unique inconsistency, then they immediately update their background scripts to test for it.
-
----
-
-## How does Camoufox compare to other solutions?
-
-### JavaScript-based solutions
-
-In the past, developers tried injecting JavaScript to spoof these values, but it doesn't work reliably since JavaScript can't spoof everything. Incomplete coverage causes inconsistent fingerprints. For example, an anti-bot system will flag you if your network request's User Agent doesn't match your navigator's User Agent.
-
-Additionally, all injected JavaScript is detectable in some way. Anti-bot systems can check if `Object.getOwnPropertyDescriptor` reveals an overwritten property, if a function's `toString()` no longer returns `[native code]` (revealing it was hijacked), or if data in the window context doesn't match the worker thread context. Workarounds only take you so far, but there will always be a way to detect JS injection if you search deep enough.
-
-#### Camoufox's approach
-
-Since Camoufox intercepts calls in the browser's C++ implementation level, all of the hijacked objects and properties appear native. There is no JavaScript hijacking to be detected.
-
-Camoufox also attempts to generate consistent and believable fingerprints with Browserforge as well. However, this can still be detected by complex fingerprint detection methods like mismatching data (as described earlier).
-
-<hr width=50>
-
-### CDP-based libraries
-
-CDP (Chrome DevTools Protocol) is an automation protocol built into Chromium and Firefox. However, CDP makes no effort to hide the fact that it's an automation protocol and exposes much of its functionality in the page scope. Some common methods are checking if `navigator.webdriver` is true, catching it reading the stack debugger, checking for variables that ChromeDriver injects into the document object for internal communication, and more.
-
-#### Camoufox's approach
-
-While Playwright uses CDP to control Chromium, it uses _Juggler_ for Firefox. Juggler is a custom protocol developed before Firefox supported CDP ([original repo](https://github.com/puppeteer/juggler)). It is a distinct module within Firefox, and not part of its core browser. This makes it easier to edit and control what's revealed to the page.
-
-Camoufox patches Juggler to give it its own isolated "copy" of the page to work with. Playwright can read and edit its own version of the page freely. Everything appears to work normally to it, but the real page is completely unaffected by these changes. The page also can't detect when things are being read (through tricks like hijacking getters) or listeners being added to watch elements.
-
-Additionally, Juggler sends its inputs directly through the Firefox's original user input handlers, meaning they are handled the exact same way as if you were using the browser normally. Camoufox also patches Firefox's headless mode to appear the same as if it were running in a normal window. But as a fallback, the Python library can run Camoufox in a [virtual display](https://camoufox.com/python/virtual-display/) if headless mode ever leaks.
-
----
-
-<h1 align="center">Build System</h1>
-
-> [!WARNING]
-> The content below is intended for those interested in building & debugging Camoufox. For Playwright usage instructions, see [here](https://github.com/daijro/camoufox/tree/main/pythonlib#camoufox-python-interface).
-
-### Overview
-
-Here is a diagram of the build system, and its associated make commands:
-
-```mermaid
-graph TD
-    FFSRC[Firefox Source] -->|make fetch| REPO
-
-    subgraph REPO[Camoufox Repository]
-        PATCHES[Fingerprint masking patches]
-        ADDONS[uBlock & B.P.C.]
-        DEBLOAT[Debloat/optimizations]
-        SYSTEM_FONTS[Win, Mac, Linux fonts]
-        JUGGLER[Patched Juggler]
-    end
-
-    subgraph Local
-    REPO -->|make dir| PATCH[Patched Source]
-    PATCH -->|make build| BUILD[Built]
-    BUILD -->|make package-linux| LINUX[Linux Portable]
-    BUILD -->|make package-windows| WIN[Windows Portable]
-    BUILD -->|make package-macos| MAC[macOS Portable]
-    end
-```
-
-This was originally based on the LibreWolf build system.
-
-## Build CLI
-
-> [!WARNING]
-> Camoufox's build system is designed to be used in Linux. WSL will not work!
-
-First, clone this repository with Git:
+MCP 适配器测试需要把核心源码放到 `PYTHONPATH`，并使用 MCP 仓库自己的虚拟环境：
 
 ```bash
-git clone --depth 1 https://github.com/daijro/camoufox
-cd camoufox
+PYTHONPATH=/path/to/camoufox-reverse/pythonlib:/path/to/camoufox-reverse-mcp/.worktrees/codex-project-scoped-reverse-sessions/src \
+  /path/to/camoufox-reverse-mcp/.venv/bin/python -m pytest -q
 ```
 
-Next, build the Camoufox source code with the following command:
+原生 tracer 测试可以绕过未安装的图像测试依赖运行：
 
 ```bash
-make dir
+python3 -m pytest --noconftest \
+  tests/test_property_tracer_runtime.py \
+  tests/test_inject_trace_to_source.py -q
 ```
 
-Before bootstrapping, install the system build dependencies with the helper
-script. It detects your platform and installs everything the build needs
-(Python ≥ 3.11, Rust, `aria2`, `p7zip`, `go`, `msitools`, `wget`, `sqlite`, and
-the core build tools) using the appropriate package manager — Homebrew on macOS,
-or `apt`/`dnf`/`pacman` on Linux:
+真实浏览器验收应只使用全新的工程目录和本地 `about:blank` 或授权测试页面，检查 manifest、raw 文件、trace、index 和异常退出状态；它不等同于 Google 登录端到端验收。
 
-```bash
-bash scripts/install-deps.sh
-```
+## 项目文档
 
-> [!NOTE]
-> The dependency installer has so far only been tested on macOS.
+- 设计说明：`docs/superpowers/specs/2026-09-23-reverse-analysis-browser-design.md`
+- 基础平台计划：`docs/superpowers/plans/2026-09-23-reverse-analysis-browser-foundation.md`
+- MCP JSON 契约：`docs/reverse-browser-mcp-contract.md`
+- 原生构建说明：`docs/releases/`
 
-After that, you have to bootstrap your system to be able to build Camoufox. You only have to do this one time. It is done by running the following command:
+## 许可证
 
-```bash
-make bootstrap
-```
-
-Finally you can build and package Camoufox the following command:
-
-```bash
-python3 multibuild.py --target linux windows macos --arch x86_64 arm64 i686
-```
-
-For new builds, `i686` is supported only for Windows. Unsupported target/architecture combinations are skipped.
-
-On a shared build host, give every concurrently running checkout a different
-absolute Mozilla state directory. This prevents one bootstrap from replacing
-the Clang toolchain or sysroot while another Firefox build is using it:
-
-```bash
-export MOZBUILD_STATE_PATH=/srv/camoufox-builds/job-123/mozbuild
-make bootstrap
-python3 multibuild.py --target linux windows macos --arch x86_64 arm64
-```
-
-If the variable is omitted, the existing `~/.mozbuild` default is preserved.
-Do not point concurrent builds at the same writable state directory.
-
-<details>
-<summary>
-CLI Parameters
-</summary>
-
-```bash
-Options:
-  -h, --help            show this help message and exit
-  --target {linux,windows,macos} [{linux,windows,macos} ...]
-                        Target platforms to build
-  --arch {x86_64,arm64,i686} [{x86_64,arm64,i686} ...]
-                        Target architectures to build for each platform
-  --bootstrap           Bootstrap the build system
-  --clean               Clean the build directory before starting
-
-Example:
-$ python3 multibuild.py --target linux windows macos --arch x86_64 arm64
-```
-
-</details>
-
-### Using Docker
-
-Camoufox can be built through Docker on all platforms.
-
-1. Create the Docker image containing Firefox's source code:
-
-```bash
-docker build -t camoufox-builder .
-```
-
-2. Build Camoufox patches to a target platform and architecture:
-
-```bash
-docker run -v "$(pwd)/dist:/app/dist" camoufox-builder --target <os> --arch <arch>
-```
-
-<details>
-<summary>
-How can I use my local ~/.mozbuild directory?
-</summary>
-
-If you want to use the host's .mozbuild directory, you can use the following command instead to run the docker:
-
-```bash
-docker run \
-  -v "$HOME/.mozbuild":/root/.mozbuild:rw,z \
-  -v "$(pwd)/dist:/app/dist" \
-  camoufox-builder \
-  --target <os> \
-  --arch <arch>
-```
-
-</details>
-
-<details>
-<summary>
-Docker CLI Parameters
-</summary>
-
-```bash
-Options:
-  -h, --help            show this help message and exit
-  --target {linux,windows,macos} [{linux,windows,macos} ...]
-                        Target platforms to build
-  --arch {x86_64,arm64,i686} [{x86_64,arm64,i686} ...]
-                        Target architectures to build for each platform
-  --bootstrap           Bootstrap the build system
-  --clean               Clean the build directory before starting
-
-Example:
-$ docker run -v "$(pwd)/dist:/app/dist" camoufox-builder --target windows macos linux --arch x86_64 arm64 i686
-```
-
-</details>
-
-Build artifacts will now appear written under the `dist/` folder.
-
----
-
-## Development Tools
-
-This repo comes with a developer UI under scripts/developer.py:
-
-```
-make edits
-```
-
-Patches can be edited, created, removed, and managed through here.
-
-<img src="https://i.imgur.com/BYAN5J0.png">
-
-### How to make a patch
-
-1. In the developer UI, click **Reset workspace**.
-2. Make changes in the `camoufox-*/` folder as needed. You can test your changes with `make build` and `make run`.
-3. After you're done making changes, click **Write workspace to patch** and save the patch file.
-
-### How to work on an existing patch
-
-1. In the developer UI, click **Edit a patch**.
-2. Select the patch you'd like to edit. Your workspace will be reset to the state of the selected patch.
-3. After you're done making changes, hit **Write workspace to patch** and overwrite the existing patch file.
-
----
-
-## Leak Debugging
-
-This is a flow chart demonstrating my process for determining leaks without deobfuscating WAF Javascript. The method incrementally reintroduces Camoufox's features into Firefox's source code until the testing site flags.
-
-This process requires a Linux system and assumes you have Firefox build tools installed (see [here](https://github.com/daijro/camoufox?tab=readme-ov-file#build-cli)).
-
-<details>
-<summary>
-See flow chart...
-</summary>
-
-```mermaid
-flowchart TD
-    A[Start] --> B[Does website flag in the official Firefox?]
-    B -->|Yes| C[Likely bad IP/rate-limiting. If the website fails on both headless and headful mode on the official Firefox distribution, the issue is not with the browser.]
-    B -->|No| D["Run make ff-dbg(1) and build(2) a clean distribution of Firefox. Does the website flag in Firefox **headless** mode(4)?"]
-    D -->|Yes| E["Does the website flag in headful mode(3) AND headless mode(4)?"]
-    D -->|No| F["Open the developer UI(5), apply config.patch, then rebuild(2). Does the website still flag(3)?"]
-    E -->|No| G["Enable privacy.resistFingerprinting in the config(6). Does the website still flag(3)?"]
-    E -->|Yes| C
-    G -->|No| H["In the config(6), enable FPP and start omitting overrides until you find the one that fixed the leak."]
-    G -->|Yes| I[If you get to this point, you may need to deobfuscate the Javascript behind the website to identify what it's testing.]
-    F -->|Yes| K["Open the developer UI, apply the playwright bootstrap patch, then rebuild. Does it still flag?"]
-    F -->|No| J["Omit options from camoufox.cfg(6) and rerun(3) until you find the one causing the leak."]
-    K -->|No| M[Juggler needs to be debugged to locate the leak.]
-    K -->|Yes| L[The issue has nothing to do with Playwright. Apply the rest of the Camoufox patches one by one until the one causing the leak is found.]
-    M --> I
-```
-
-#### Cited Commands
-
-| #   | Command                                       | Description                                                                                                 |
-| --- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| (1) | `make ff-dbg`                                 | Setup vanilla Firefox with minimal patches.                                                                 |
-| (2) | `make build`                                  | Build the source code.                                                                                      |
-| (3) | `make run`                                    | Runs the built browser.                                                                                     |
-| (4) | `make run args="--headless https://test.com"` | Run a URL in headless mode. All redirects will be printed to the console to determine if the test passed.   |
-| (5) | `make edits`                                  | Opens the developer UI. Allows the user to apply/undo patches, and see which patches are currently applied. |
-| (6) | `make edit-cfg`                               | Edit camoufox.cfg in the default system editor.                                                             |
-
-</details>
-
----
-
-## Thanks
-
-Debloating & references:
-
-- [LibreWolf](https://gitlab.com/librewolf-community/browser/source): Debloat patches & build system inspiration
-- [BetterFox](https://github.com/yokoffing/BetterFox): Speed and debloat preferences
-- [Ghostery](https://github.com/ghostery/user-agent-desktop): Debloat reference ([disable onboarding](https://github.com/daijro/camoufox/blob/main/patches/ghostery/Disable-Onboarding-Messages.patch))
-
-Web scraping & testing:
-
-- [riflosnake/HumanCursor](https://github.com/riflosnake/HumanCursor): Original human-like cursor movement algorithm, ported to C++
-- [CreepJS](https://github.com/abrahamjuliot/creepjs), [Browserleaks](https://browserleaks.com), [BrowserScan](https://www.browserscan.net/) - Valuable leak testing sites
-
-UI theming:
-
-- [Jamir-boop/minimalisticfox](https://github.com/Jamir-boop/minimalisticfox): Inspired Camoufox's minimal css theming [(link)](https://github.com/daijro/camoufox/blob/main/settings/chrome.css)
+本项目沿用仓库中的 MIT 许可证，详见 [`LICENSE`](LICENSE)。

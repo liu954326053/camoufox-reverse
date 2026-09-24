@@ -116,6 +116,8 @@ class EvidenceStore:
             raw_path = os.fspath(relative_path)
         except TypeError as exc:
             raise EvidenceError("Artifact path must be path-like") from exc
+        if not isinstance(raw_path, str) or "\x00" in raw_path:
+            raise EvidenceError("Artifact path must be a valid string path")
         candidate = Path(raw_path)
         if not raw_path or candidate.is_absolute():
             raise EvidenceError("Artifact path must stay inside the session")
@@ -565,10 +567,14 @@ class EvidenceStore:
             raise EvidenceError("Session index directory was replaced")
 
     def _native_event_loss(
-        self, artifacts: list[dict[str, Any]], malformed_by_path: dict[str, int]
+        self,
+        artifacts: list[dict[str, Any]],
+        malformed_by_path: dict[str, int],
+        *,
+        trace_enabled: bool,
     ) -> tuple[int, list[dict[str, str]]]:
         """Account for stopped producers using indexed bytes, including snapshots."""
-        traces: dict[str, dict[str, tuple[int, int]]] = {}
+        traces: dict[str, dict[str, tuple[int, int, int]]] = {}
         metadata: dict[str, list[dict[str, Any]]] = {}
         gaps: set[tuple[str, str]] = set()
         seen: set[str] = set()
@@ -579,7 +585,9 @@ class EvidenceStore:
             seen.add(path)
             if source.endswith(".jsonl"):
                 traces.setdefault(source, {})[path] = (
-                    artifact["event_count"], malformed_by_path[path]
+                    artifact["event_count"],
+                    malformed_by_path[path],
+                    artifact["bytes"],
                 )
             elif source.endswith(".meta.json"):
                 trace = source.removesuffix(".meta.json")
@@ -609,6 +617,8 @@ class EvidenceStore:
                     gaps.add((trace, "native_write_error"))
 
         loss = 0
+        if trace_enabled and not traces and not metadata:
+            gaps.add(("trace", "missing_native_trace"))
         for source in sorted(traces.keys() | metadata.keys()):
             observations = traces.get(source, {})
             entries = metadata.get(source, [])
@@ -623,8 +633,12 @@ class EvidenceStore:
             # Aliases and repeated registrations describe one producer, not new loss.
             loss += max(entry["dropped"] for entry in entries)
             expected = max(entry["events"] for entry in entries)
-            observed = max((count for count, _ in observations.values()), default=0)
-            malformed = sum(count for _, count in observations.values())
+            latest = max(
+                observations.values(),
+                key=lambda observation: (observation[2], observation[0], observation[1]),
+                default=(0, 0, 0),
+            )
+            observed, malformed, _ = latest
             loss += max(0, expected - observed - malformed)
             if expected != observed:
                 gaps.add((source, "native_event_count_mismatch"))
@@ -674,7 +688,7 @@ class EvidenceStore:
                 pass
         return self.session.project.indexes_dir / name
 
-    def _rebuild_index_unlocked(self) -> Path:
+    def _build_index_unlocked(self) -> tuple[Path, dict[str, Any]]:
         """Build one lock-consistent snapshot and reconcile its manifest."""
         self._ensure_open()
         manifest = self._manifest()
@@ -698,12 +712,10 @@ class EvidenceStore:
             registered.setdefault(source, []).append(record)
         files: dict[str, dict[str, Any]] = {}
         artifacts: list[dict[str, Any]] = []
-        malformed_total = 0
-        counted_snapshots: set[str] = set()
+        malformed_by_source: dict[str, int] = {}
         malformed_by_path: dict[str, int] = {}
 
         def add_registered_artifact(entry: dict[str, Any], source: str) -> None:
-            nonlocal malformed_total
             snapshot = entry.get("path")
             snapshot_normalized, snapshot_parts = self._parts(snapshot)
             if snapshot_normalized != snapshot or not self._is_snapshot_path(snapshot):
@@ -718,9 +730,9 @@ class EvidenceStore:
             observed_bytes, observed_hash, observed_events, observed_malformed, observed_sequences = observed
             if entry.get("size") != observed_bytes or entry.get("sha256") != observed_hash:
                 raise EvidenceError(f"Registered artifact metadata no longer matches: {source}")
-            if snapshot not in counted_snapshots:
-                malformed_total += observed_malformed
-                counted_snapshots.add(snapshot)
+            malformed_by_source[source] = max(
+                malformed_by_source.get(source, 0), observed_malformed
+            )
             malformed_by_path[snapshot] = observed_malformed
             item = dict(entry)
             item["source_path"] = source
@@ -748,7 +760,7 @@ class EvidenceStore:
                 for entry in entries:
                     add_registered_artifact(entry, relative)
             else:
-                malformed_total += malformed
+                malformed_by_source[relative] = malformed
                 malformed_by_path[relative] = malformed
                 artifacts.append(
                     {
@@ -783,17 +795,27 @@ class EvidenceStore:
                 json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             )
         )
-        native_loss, loss_gaps = self._native_event_loss(artifacts, malformed_by_path)
+        malformed_total = sum(malformed_by_source.values())
+        native_loss, loss_gaps = self._native_event_loss(
+            artifacts,
+            malformed_by_path,
+            trace_enabled=manifest.get("trace_enabled", False),
+        )
         index = {
             "schema": 1,
             "session_id": self.session.session_id,
-            "event_loss": int(manifest.get("event_loss", 0)) + malformed_total + native_loss,
+            "event_loss": max(
+                int(manifest.get("event_loss", 0)), malformed_total + native_loss
+            ),
             "event_loss_complete": not loss_gaps,
             "event_loss_gaps": loss_gaps,
             "artifacts": artifacts,
             "files": {key: files[key] for key in sorted(files)},
         }
-        return self._write_index(index)
+        return self._write_index(index), index
+
+    def _rebuild_index_unlocked(self) -> Path:
+        return self._build_index_unlocked()[0]
 
     def rebuild_index(self) -> Path:
         with self._evidence_lock():
@@ -830,9 +852,17 @@ class EvidenceStore:
         """Flush, build the index, then finalize the associated session."""
         with self._evidence_lock():
             self._flush_unlocked()
-            index_path = self._rebuild_index_unlocked()
+            index_path, index = self._build_index_unlocked()
+            final_status = status
+            if status == "complete" and (
+                index["event_loss"] > 0 or not index["event_loss_complete"]
+            ):
+                final_status = "incomplete"
             try:
-                self.session._close_from_evidence(status)
+                self.session._close_from_evidence(
+                    final_status,
+                    event_loss=index["event_loss"],
+                )
             except reverse_project.ProjectError as exc:
                 raise EvidenceError("Cannot finalize evidence session") from exc
             return index_path

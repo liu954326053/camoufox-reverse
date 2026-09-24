@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camoufox-reverse-mcp-client"
+version = "1.0.0"
+description = "Dependency-free Python stdio client for Camoufox Reverse MCP"
+requires-python = ">=3.10"
+
+[project.scripts]
+camoufox-reverse-mcp-client = "camoufox_reverse_mcp_client.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
