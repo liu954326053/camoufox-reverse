@@ -108,7 +108,7 @@ The returned Playwright launch options must contain a `CAMOU_CONFIG` payload who
 - Consumes: filesystem path and optional `resume_session`.
 - Produces: `ReverseProject`, `ReverseSession`, manifest paths and lifecycle status used by Tasks 2–4.
 
-- [ ] **Step 1: Write failing tests for required project directory behavior**
+- [x] **Step 1: Write failing tests for required project directory behavior**
 
 Add tests for:
 
@@ -129,7 +129,7 @@ def test_open_rejects_file_project_path(tmp_path):
         ReverseProject.open(path)
 ```
 
-- [ ] **Step 2: Run the focused tests and verify the expected failure**
+- [x] **Step 2: Run the focused tests and verify the expected failure**
 
 Run:
 
@@ -140,7 +140,7 @@ python -m pytest tests/test_reverse_project.py -q
 
 Expected: collection or assertion failure because `reverse_project.py` does not exist.
 
-- [ ] **Step 3: Implement path validation and permission setup**
+- [x] **Step 3: Implement path validation and permission setup**
 
 Implement `ReverseProject.open()` so it:
 
@@ -150,7 +150,7 @@ Implement `ReverseProject.open()` so it:
 4. Rejects a regular file, unreadable directory, or path whose parent is not writable.
 5. Never falls back to a temporary directory.
 
-- [ ] **Step 4: Add isolated session tests before implementation**
+- [x] **Step 4: Add isolated session tests before implementation**
 
 Add tests for two sessions:
 
@@ -166,7 +166,7 @@ def test_each_launch_gets_a_unique_isolated_session(tmp_path):
 
 Also test that `resume_session` only resumes an existing `incomplete` session. A `complete` session is immutable and must be rejected, so restoring it cannot overwrite original evidence.
 
-- [ ] **Step 5: Implement session manifest and lifecycle**
+- [x] **Step 5: Implement session manifest and lifecycle**
 
 Create `manifest.json` atomically with:
 
@@ -187,7 +187,7 @@ Create `manifest.json` atomically with:
 
 Implement `mark_incomplete()` for exceptions and `close()` for complete/incomplete finalization. Never print secret fields while reporting errors.
 
-- [ ] **Step 6: Run the focused project tests**
+- [x] **Step 6: Run the focused project tests**
 
 Run:
 
@@ -198,7 +198,7 @@ python -m pytest tests/test_reverse_project.py -q
 
 Expected: all lifecycle, permission, isolation and incomplete-session tests pass.
 
-- [ ] **Step 7: Commit the session boundary**
+- [x] **Step 7: Commit the session boundary**
 
 ```sh
 git add pythonlib/camoufox/reverse_project.py pythonlib/tests/test_reverse_project.py
@@ -215,7 +215,7 @@ git commit -m "feat: add reverse analysis project sessions"
 - Consumes: `ReverseSession` from Task 1.
 - Produces: append-only JSONL, raw artifact registry and deterministic `indexes/session.json`.
 
-- [ ] **Step 1: Write failing tests for raw append and path containment**
+- [x] **Step 1: Write failing tests for raw append and path containment**
 
 Cover complete raw values and traversal rejection:
 
@@ -232,7 +232,7 @@ def test_artifact_path_cannot_escape_session(tmp_path):
         EvidenceStore(session).append_bytes("../outside", b"bad")
 ```
 
-- [ ] **Step 2: Run the focused tests and verify failure**
+- [x] **Step 2: Run the focused tests and verify failure**
 
 ```sh
 cd pythonlib
@@ -241,7 +241,7 @@ python -m pytest tests/test_reverse_evidence.py -q
 
 Expected: failure because `EvidenceStore` is not implemented.
 
-- [ ] **Step 3: Implement atomic raw writers**
+- [x] **Step 3: Implement atomic raw writers**
 
 Implement:
 
@@ -254,15 +254,15 @@ Implement:
 
 Raw values must not pass through redaction, truncation or lossy Unicode conversion.
 
-- [ ] **Step 4: Add deterministic index rebuild tests**
+- [x] **Step 4: Add deterministic index rebuild tests**
 
 Create two raw files in different creation orders and assert `rebuild_index()` produces stable sorting by session-relative path, event sequence and artifact hash. Assert that a second rebuild does not modify raw files.
 
-- [ ] **Step 5: Implement index and event-loss accounting**
+- [x] **Step 5: Implement index and event-loss accounting**
 
 Write `indexes/<session_id>.json` with artifact list, per-file byte counts, event counts, hashes and `event_loss`. The index must be rebuildable after an incomplete session without requiring a running browser.
 
-- [ ] **Step 6: Run evidence tests and a filesystem permission check**
+- [x] **Step 6: Run evidence tests and a filesystem permission check**
 
 ```sh
 cd pythonlib
@@ -271,7 +271,7 @@ python -m pytest tests/test_reverse_evidence.py -q
 
 Expected: raw content, containment, append ordering, index determinism and permission tests pass.
 
-- [ ] **Step 7: Commit the evidence layer**
+- [x] **Step 7: Commit the evidence layer**
 
 ```sh
 git add pythonlib/camoufox/reverse_evidence.py pythonlib/tests/test_reverse_evidence.py
@@ -289,7 +289,7 @@ git commit -m "feat: add raw evidence store and session indexes"
 - Consumes: `ReverseProject`, `ReverseSession` and existing `launch_options()`.
 - Produces: Playwright launch options, session manifest updates and `propertyTrace.logDir` under the session.
 
-- [ ] **Step 1: Write failing tests for mandatory project and trace configuration**
+- [x] **Step 1: Write failing tests for mandatory project and trace configuration**
 
 Mock `camoufox.utils.launch_options` and assert:
 
@@ -309,7 +309,7 @@ def test_reverse_launch_points_property_trace_inside_session(tmp_path, monkeypat
     assert options["config"]["propertyTrace"]["enabled"] is True
 ```
 
-- [ ] **Step 2: Run the focused tests and verify failure**
+- [x] **Step 2: Run the focused tests and verify failure**
 
 ```sh
 cd pythonlib
@@ -318,7 +318,7 @@ python -m pytest tests/test_reverse_launch.py -q
 
 Expected: failure because the reverse launch module is absent.
 
-- [ ] **Step 3: Implement profile and proxy normalization**
+- [x] **Step 3: Implement profile and proxy normalization**
 
 Implement `reverse_launch_options(project_dir, proxy=None, browser_version=None, trace_profile="overview", resume_session=None, **kwargs)`:
 
@@ -330,11 +330,11 @@ Implement `reverse_launch_options(project_dir, proxy=None, browser_version=None,
 6. Mark the session `running` only after options are built successfully.
 7. Return `(options, session)` and leave browser ownership to the caller.
 
-- [ ] **Step 4: Add compatibility tests for sync and async wrappers**
+- [x] **Step 4: Add compatibility tests for sync and async wrappers**
 
 Test that `from camoufox import reverse_launch_options` is available, ordinary `launch_options()` behavior is unchanged, and caller config values remain present beside `propertyTrace`.
 
-- [ ] **Step 5: Run launch tests and existing utility tests**
+- [x] **Step 5: Run launch tests and existing utility tests**
 
 ```sh
 cd pythonlib
@@ -343,7 +343,7 @@ python -m pytest tests/test_reverse_launch.py tests/test_server.py -q
 
 Expected: reverse tests pass and existing server tests remain green.
 
-- [ ] **Step 6: Commit launch integration**
+- [x] **Step 6: Commit launch integration**
 
 ```sh
 git add pythonlib/camoufox/reverse_launch.py pythonlib/camoufox/__init__.py pythonlib/tests/test_reverse_launch.py
@@ -361,7 +361,7 @@ git commit -m "feat: add project-scoped reverse launch options"
 - Consumes: Task 1 session and Task 2 evidence APIs.
 - Produces: `reverse-browser` commands that use the same core as MCP.
 
-- [ ] **Step 1: Write failing CLI tests**
+- [x] **Step 1: Write failing CLI tests**
 
 Test these exact behaviors:
 
@@ -377,7 +377,7 @@ def test_session_list_returns_json(runner, tmp_path):
     assert json.loads(result.output)["sessions"] == []
 ```
 
-- [ ] **Step 2: Run CLI tests and verify failure**
+- [x] **Step 2: Run CLI tests and verify failure**
 
 ```sh
 cd pythonlib
@@ -386,7 +386,7 @@ python -m pytest tests/test_reverse_cli.py -q
 
 Expected: failure because `reverse_cli` and its console entrypoint do not exist.
 
-- [ ] **Step 3: Implement the thin Click CLI**
+- [x] **Step 3: Implement the thin Click CLI**
 
 Register:
 
@@ -404,7 +404,7 @@ Implement:
 
 Commands must print machine-readable JSON by default, never raw secret values, and return non-zero on invalid paths or incomplete operations. Browser launch/close handling must call `session.mark_incomplete()` on exceptions.
 
-- [ ] **Step 4: Run CLI and packaging tests**
+- [x] **Step 4: Run CLI and packaging tests**
 
 ```sh
 cd pythonlib
@@ -415,7 +415,7 @@ reverse-browser --help
 
 Expected: CLI help lists the reverse commands and the focused tests pass.
 
-- [ ] **Step 5: Commit the CLI**
+- [x] **Step 5: Commit the CLI**
 
 ```sh
 git add pythonlib/camoufox/reverse_cli.py pythonlib/pyproject.toml pythonlib/tests/test_reverse_cli.py
@@ -433,11 +433,11 @@ git commit -m "feat: add reverse-browser CLI"
 - Consumes: `propertyTrace.logDir` generated by Task 3.
 - Produces: verifiable contract that native PropertyTracer writes under the requested session directory and exposes loss/status metadata for index rebuild.
 
-- [ ] **Step 1: Add a contract test for an externally supplied trace directory**
+- [x] **Step 1: Add a contract test for an externally supplied trace directory**
 
 Extend the native harness to set the trace base directory to a session `trace/` path and assert every JSONL file is below that directory, has `k`, `q`, `u`, `w`, and `s`, and no control file remains after shutdown.
 
-- [ ] **Step 2: Run the native tracer test and verify the new assertion fails or is incomplete**
+- [x] **Step 2: Run the native tracer test and verify the new assertion fails or is incomplete**
 
 ```sh
 python -m pytest tests/test_property_tracer_runtime.py -q
@@ -445,11 +445,11 @@ python -m pytest tests/test_property_tracer_runtime.py -q
 
 Expected: the existing test remains green while the new session-path assertion identifies any missing contract field or path behavior.
 
-- [ ] **Step 3: Make only the required native contract changes**
+- [x] **Step 3: Make only the required native contract changes**
 
 Do not change the 77 existing hook meanings. Only adjust capabilities metadata or status/event fields if the session store requires a field that is not already emitted. Preserve protocol-v1 compatibility and the existing opt-in behavior.
 
-- [ ] **Step 4: Run all tracer and injector tests**
+- [x] **Step 4: Run all tracer and injector tests**
 
 ```sh
 python -m pytest tests/test_property_tracer_runtime.py tests/test_inject_trace_to_source.py -q
@@ -457,7 +457,7 @@ python -m pytest tests/test_property_tracer_runtime.py tests/test_inject_trace_t
 
 Expected: native buffering, control transitions, source injection, event kinds, sequence and path checks pass.
 
-- [ ] **Step 5: Commit the contract update**
+- [x] **Step 5: Commit the contract update**
 
 ```sh
 git add settings/camoufox-reverse-capabilities.json tests/test_property_tracer_runtime.py tests/test_reverse_project_contract.py
@@ -474,7 +474,7 @@ git commit -m "test: verify project-scoped property tracing"
 - Consumes: Task 1–5 Python APIs.
 - Produces: a stable JSON contract that the external `mcp__camoufox_reverse` bridge can implement without duplicating project/session logic.
 
-- [ ] **Step 1: Write contract fixtures and failing validation tests**
+- [x] **Step 1: Write contract fixtures and failing validation tests**
 
 Define request/response fixtures for:
 
@@ -488,7 +488,7 @@ Define request/response fixtures for:
 
 and assert responses contain only paths, IDs, status, counts and explicit artifact references, never implicit temporary directories.
 
-- [ ] **Step 2: Run contract tests and verify failure**
+- [x] **Step 2: Run contract tests and verify failure**
 
 ```sh
 cd pythonlib
@@ -497,7 +497,7 @@ python -m pytest tests/test_reverse_mcp_contract.py -q
 
 Expected: failure until the schema and validator exist.
 
-- [ ] **Step 3: Document MCP methods and implement local validator**
+- [x] **Step 3: Document MCP methods and implement local validator**
 
 Document these methods:
 
@@ -512,7 +512,7 @@ Document these methods:
 
 The contract must state that `project_dir` is mandatory and that all returned artifact paths are inside the current session directory.
 
-- [ ] **Step 4: Run contract and documentation checks**
+- [x] **Step 4: Run contract and documentation checks**
 
 ```sh
 cd pythonlib
@@ -520,7 +520,7 @@ python -m pytest tests/test_reverse_mcp_contract.py -q
 git diff --check
 ```
 
-- [ ] **Step 5: Commit the bridge contract**
+- [x] **Step 5: Commit the bridge contract**
 
 ```sh
 git add docs/reverse-browser-mcp-contract.md pythonlib/tests/test_reverse_mcp_contract.py
@@ -538,7 +538,7 @@ git commit -m "docs: define reverse browser MCP contract"
 - Consumes: all foundation APIs.
 - Produces: a local, browser-free integration test plus documented real-browser smoke commands.
 
-- [ ] **Step 1: Write browser-free integration tests**
+- [x] **Step 1: Write browser-free integration tests**
 
 Cover this sequence:
 
@@ -554,7 +554,7 @@ EvidenceStore(same_session).rebuild_index()
 
 Also verify raw values survive index rebuilding and no output is written outside the project tree.
 
-- [ ] **Step 2: Run the integration tests and the existing Python suite**
+- [x] **Step 2: Run the integration tests and the existing Python suite**
 
 ```sh
 cd pythonlib
@@ -563,7 +563,7 @@ python -m pytest tests/test_reverse_*.py tests/test_server.py -q
 
 Expected: all new foundation tests and existing server tests pass.
 
-- [ ] **Step 3: Document the real-browser smoke test**
+- [x] **Step 3: Document the real-browser smoke test**
 
 Add README instructions using the installed reverse selector and local proxy:
 
@@ -577,7 +577,7 @@ reverse-browser launch \
 
 The documented acceptance checks must inspect `runs/<session_id>/manifest.json`, raw trace files, index rebuild and incomplete-session behavior. Do not claim Google end-to-end success in this foundation plan.
 
-- [ ] **Step 4: Run final verification for the foundation**
+- [x] **Step 4: Run final verification for the foundation**
 
 ```sh
 cd pythonlib
@@ -587,7 +587,7 @@ python -m pytest tests/test_property_tracer_runtime.py tests/test_inject_trace_t
 git diff --check
 ```
 
-- [ ] **Step 5: Commit documentation and integration tests**
+- [x] **Step 5: Commit documentation and integration tests**
 
 ```sh
 git add pythonlib/tests/test_reverse_integration.py README.md docs/releases/_template.md
@@ -610,11 +610,11 @@ git commit -m "test: verify reverse browser foundation"
 - Consumes: Task 6 JSON contract and Task 3/4 Python project/session APIs.
 - Produces: actual MCP calls that create project-scoped sessions and never fall back to `~/.cache/camoufox-reverse` for an opted-in project.
 
-- [ ] **Step 1: Add failing bridge tests for mandatory project and raw capture**
+- [x] **Step 1: Add failing bridge tests for mandatory project and raw capture**
 
 Test `launch_browser` rejects missing, empty, relative and escaping project paths; accepts `capture_profile="raw"`; returns `session_id`, `session_dir`, `manifest` and `trace_dir`; and rejects unknown profiles before browser startup.
 
-- [ ] **Step 2: Run the external MCP focused tests and verify failure**
+- [x] **Step 2: Run the external MCP focused tests and verify failure**
 
 ```sh
 cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
@@ -623,19 +623,19 @@ cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
 
 Expected: the new project/session contract tests fail against the current cache-root implementation.
 
-- [ ] **Step 3: Thread project/session configuration through MCP startup**
+- [x] **Step 3: Thread project/session configuration through MCP startup**
 
 Add `--project-dir` to the MCP process entrypoint and `project_dir`/`capture_profile` to `launch_browser`. `BrowserManager` must create exactly one session through the Python core, pass its trace root into `propertyTrace.logDir`, and retain the session until `close_browser()`.
 
-- [ ] **Step 4: Make trace and environment tools session-aware**
+- [x] **Step 4: Make trace and environment tools session-aware**
 
 Replace module-global `CACHE_DIR`, `CONTROL_DIR` and `TRACES_DIR` reads with the active session paths. `list_trace_files`, `query_trace_file`, `trace_property_access`, `collect_values`, and `check_environment` must return explicit paths inside the active session. No adapter-local temporary artifact path may be returned.
 
-- [ ] **Step 5: Enforce raw artifact and close/error behavior**
+- [x] **Step 5: Enforce raw artifact and close/error behavior**
 
 Persist network captures, script saves, screenshots, state exports and trace files through the active session store. Normalize and resolve every returned path before containment checks. On launch failure, mark the session `incomplete`; on close, finalize the manifest; on a second close, return an already-closed status without creating a session.
 
-- [ ] **Step 6: Run external MCP tests and the Python contract tests**
+- [x] **Step 6: Run external MCP tests and the Python contract tests**
 
 ```sh
 cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
@@ -646,7 +646,7 @@ python3 -m pytest tests/test_reverse_mcp_contract.py -q
 
 Expected: external bridge tests cover real lifecycle/path behavior and the repository contract remains green.
 
-- [ ] **Step 7: Commit external bridge changes in its own repository**
+- [x] **Step 7: Commit external bridge changes in its own repository**
 
 ```sh
 cd /Users/magic/.codex/mcp-servers/camoufox-reverse-mcp/source
