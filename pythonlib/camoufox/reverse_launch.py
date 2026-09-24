@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
@@ -121,6 +122,13 @@ def reverse_launch_options(
             config.pop("propertyTrace", None)
 
         launch_kwargs = dict(kwargs)
+        environment = dict(launch_kwargs.get("env") or os.environ)
+        temporary = session.path / "runtime" / "tmp"
+        temporary.mkdir(mode=0o700, parents=True, exist_ok=True)
+        environment.update(TMPDIR=str(temporary), TMP=str(temporary), TEMP=str(temporary))
+        if enable_trace:
+            environment["MOZ_DISABLE_CONTENT_SANDBOX"] = "1"
+        launch_kwargs["env"] = environment
         launch_kwargs["config"] = config
         normalized_proxy = (
             _proxy_dict(proxy) if proxy is not None else launch_kwargs.get("proxy")

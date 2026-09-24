@@ -419,7 +419,7 @@ class EvidenceStore:
                 malformed += 1
                 continue
             count += 1
-            sequence = value.get("sequence")
+            sequence = value.get("sequence", value.get("q"))
             if isinstance(sequence, int) and not isinstance(sequence, bool):
                 sequences.append(sequence)
         return count, malformed, sequences
@@ -507,16 +507,25 @@ class EvidenceStore:
 
     def _raw_files(self) -> list[tuple[str, tuple[str, ...]]]:
         files = []
-        for path in sorted(self.raw_dir.rglob("*")):
-            if not path.is_file() or path.is_symlink():
-                continue
-            relative = path.relative_to(self.root).as_posix()
-            raw_relative = path.relative_to(self.raw_dir)
-            if relative == _REGISTRY_PATH or any(
-                part.startswith(".") for part in raw_relative.parts
-            ):
-                continue
-            files.append((relative, tuple(relative.split("/"))))
+        for directory in (self.raw_dir, self.root / "trace"):
+            for path in sorted(directory.rglob("*")):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                relative = path.relative_to(self.root).as_posix()
+                local_parts = path.relative_to(directory).parts
+                if relative == _REGISTRY_PATH or any(
+                    part.startswith(".") for part in local_parts
+                ):
+                    continue
+                if directory.name == "trace" and (
+                    "control" in local_parts
+                    or path.name == "desired.state"
+                    or path.match("control-*.cmd")
+                    or path.match("status-*.state")
+                    or path.name.endswith(".tmp")
+                ):
+                    continue
+                files.append((relative, tuple(relative.split("/"))))
         return files
 
     def _file_snapshot(
@@ -554,6 +563,74 @@ class EvidenceStore:
             raise EvidenceError("Session index directory cannot be a symlink")
         if self._identity(current) != self._indexes_identity:
             raise EvidenceError("Session index directory was replaced")
+
+    def _native_event_loss(
+        self, artifacts: list[dict[str, Any]], malformed_by_path: dict[str, int]
+    ) -> tuple[int, list[dict[str, str]]]:
+        """Account for stopped producers using indexed bytes, including snapshots."""
+        traces: dict[str, dict[str, tuple[int, int]]] = {}
+        metadata: dict[str, list[dict[str, Any]]] = {}
+        gaps: set[tuple[str, str]] = set()
+        seen: set[str] = set()
+        for artifact in artifacts:
+            source, path = artifact["source_path"], artifact["path"]
+            if not source.startswith("trace/") or path in seen:
+                continue
+            seen.add(path)
+            if source.endswith(".jsonl"):
+                traces.setdefault(source, {})[path] = (
+                    artifact["event_count"], malformed_by_path[path]
+                )
+            elif source.endswith(".meta.json"):
+                trace = source.removesuffix(".meta.json")
+                if not trace.endswith(".jsonl"):
+                    trace += ".jsonl"
+                entries = metadata.setdefault(trace, [])
+                with self._opened_relative(self._parts(path)[1], os.O_RDONLY) as (fd, _):
+                    payload = self._read_fd(fd)
+                if hashlib.sha256(payload).hexdigest() != artifact["content_sha256"]:
+                    raise EvidenceError(f"Native metadata changed during indexing: {source}")
+                try:
+                    value = json.loads(payload)
+                except (ValueError, UnicodeError):
+                    value = None
+                if not isinstance(value, dict) or any(
+                    not isinstance(value.get(key), int)
+                    or isinstance(value[key], bool)
+                    or value[key] < 0
+                    for key in ("session_id", "events", "dropped")
+                ):
+                    gaps.add((trace, "invalid_native_metadata"))
+                    continue
+                entries.append(value)
+                if value.get("state") != "off":
+                    gaps.add((trace, "native_not_finalized"))
+                if value.get("detail"):
+                    gaps.add((trace, "native_write_error"))
+
+        loss = 0
+        for source in sorted(traces.keys() | metadata.keys()):
+            observations = traces.get(source, {})
+            entries = metadata.get(source, [])
+            if source not in metadata:
+                gaps.add((source, "missing_native_metadata"))
+            if not observations:
+                gaps.add((source, "missing_native_trace"))
+            if not entries:
+                continue
+            if len({json.dumps(entry, sort_keys=True) for entry in entries}) > 1:
+                gaps.add((source, "conflicting_native_metadata"))
+            # Aliases and repeated registrations describe one producer, not new loss.
+            loss += max(entry["dropped"] for entry in entries)
+            expected = max(entry["events"] for entry in entries)
+            observed = max((count for count, _ in observations.values()), default=0)
+            malformed = sum(count for _, count in observations.values())
+            loss += max(0, expected - observed - malformed)
+            if expected != observed:
+                gaps.add((source, "native_event_count_mismatch"))
+        return loss, [
+            {"source_path": source, "reason": reason} for source, reason in sorted(gaps)
+        ]
 
     def _write_index(self, index: dict[str, Any]) -> Path:
         self._validate_indexes_directory()
@@ -616,12 +693,14 @@ class EvidenceStore:
                 raise EvidenceError("Registered artifact source path is invalid")
             source, source_parts = self._parts(source)
             self._reject_snapshot_path(source)
-            if source_parts[0] != "raw":
-                raise EvidenceError("Registered artifact source path must be under raw")
+            if source_parts[0] not in {"raw", "trace"}:
+                raise EvidenceError("Registered artifact source path must be under raw or trace")
             registered.setdefault(source, []).append(record)
         files: dict[str, dict[str, Any]] = {}
         artifacts: list[dict[str, Any]] = []
         malformed_total = 0
+        counted_snapshots: set[str] = set()
+        malformed_by_path: dict[str, int] = {}
 
         def add_registered_artifact(entry: dict[str, Any], source: str) -> None:
             nonlocal malformed_total
@@ -639,7 +718,10 @@ class EvidenceStore:
             observed_bytes, observed_hash, observed_events, observed_malformed, observed_sequences = observed
             if entry.get("size") != observed_bytes or entry.get("sha256") != observed_hash:
                 raise EvidenceError(f"Registered artifact metadata no longer matches: {source}")
-            malformed_total += observed_malformed
+            if snapshot not in counted_snapshots:
+                malformed_total += observed_malformed
+                counted_snapshots.add(snapshot)
+            malformed_by_path[snapshot] = observed_malformed
             item = dict(entry)
             item["source_path"] = source
             item.update(
@@ -656,7 +738,6 @@ class EvidenceStore:
             byte_count, content_hash, event_count, malformed, sequences = self._file_snapshot(
                 relative, parts
             )
-            malformed_total += malformed
             files[relative] = {
                 "bytes": byte_count,
                 "event_count": event_count,
@@ -667,6 +748,8 @@ class EvidenceStore:
                 for entry in entries:
                     add_registered_artifact(entry, relative)
             else:
+                malformed_total += malformed
+                malformed_by_path[relative] = malformed
                 artifacts.append(
                     {
                         "path": relative,
@@ -700,10 +783,13 @@ class EvidenceStore:
                 json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             )
         )
+        native_loss, loss_gaps = self._native_event_loss(artifacts, malformed_by_path)
         index = {
             "schema": 1,
             "session_id": self.session.session_id,
-            "event_loss": int(manifest.get("event_loss", 0)) + malformed_total,
+            "event_loss": int(manifest.get("event_loss", 0)) + malformed_total + native_loss,
+            "event_loss_complete": not loss_gaps,
+            "event_loss_gaps": loss_gaps,
             "artifacts": artifacts,
             "files": {key: files[key] for key in sorted(files)},
         }
@@ -714,7 +800,7 @@ class EvidenceStore:
             return self._rebuild_index_unlocked()
 
     def _flush_unlocked(self) -> None:
-        """Fsync raw files and registry before session shutdown."""
+        """Fsync raw/trace files and registry after producers have stopped."""
         self._ensure_open()
         paths = [parts for _, parts in self._raw_files()]
         paths.append(tuple(_REGISTRY_PATH.split("/")))

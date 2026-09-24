@@ -38,6 +38,20 @@ def test_property_trace_is_a_known_dict_config_without_stdout_warning(capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_legacy_properties_schema_accepts_validated_trace_key(monkeypatch, capsys):
+    monkeypatch.setattr("camoufox.utils._load_properties", lambda **kwargs: {})
+    validate_config({"propertyTrace": {"enabled": True, "logDir": "/fixture"}})
+    assert capsys.readouterr().out == ""
+
+
+def test_trace_launch_sets_session_scoped_process_environment(tmp_path, monkeypatch):
+    monkeypatch.setattr("camoufox.reverse_launch.launch_options", lambda **kwargs: kwargs)
+    options, session = reverse_launch_options(project_dir=tmp_path / "p")
+    assert options["env"]["MOZ_DISABLE_CONTENT_SANDBOX"] == "1"
+    assert options["env"]["TMPDIR"].startswith(str(session.path))
+    assert "MOZ_DISABLE_CONTENT_SANDBOX" not in __import__("os").environ
+
+
 def test_reverse_launch_no_trace_omits_property_trace_config(tmp_path, monkeypatch):
     monkeypatch.setattr("camoufox.reverse_launch.launch_options", lambda **kwargs: kwargs)
     caller_config = {

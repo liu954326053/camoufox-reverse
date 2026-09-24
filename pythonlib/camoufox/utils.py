@@ -172,6 +172,8 @@ def validate_config(config_map: Dict[str, str], path: Optional[Path] = None) -> 
     Validates the config map.
     """
     property_types = _load_properties(path=path)
+    # Older reverse bundles recognize the native option but omit its schema.
+    property_types.setdefault('propertyTrace', 'dict')
 
     for key, value in config_map.items():
         expected_type = property_types.get(key)

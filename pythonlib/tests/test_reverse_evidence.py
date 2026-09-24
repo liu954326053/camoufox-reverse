@@ -17,6 +17,150 @@ def _store(tmp_path):
     return session, EvidenceStore(session)
 
 
+def test_registered_malformed_events_count_once_across_snapshot_and_kinds(tmp_path):
+    _, store = _store(tmp_path)
+    payload = b'{"sequence":1}\nnot-json\n'
+    store.append_bytes("raw/events.jsonl", payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    for kind in ("network", "diagnostic"):
+        store.register_artifact("raw/events.jsonl", digest, len(payload), kind)
+    index = json.loads(store.rebuild_index().read_text())
+    assert index["event_loss"] == 1
+
+
+def _native_trace(store, *, payload=b'{"k":0,"q":0,"u":1,"w":2,"s":"test"}\n', metadata=None):
+    source = "trace/traces/123_0.jsonl"
+    store.append_bytes(source, payload)
+    if metadata is not None:
+        store.append_bytes(source + ".meta.json", json.dumps(metadata).encode() + b"\n")
+    return source
+
+
+def test_native_trace_and_sidecar_are_indexed_without_control_files(tmp_path):
+    session, store = _store(tmp_path)
+    source = _native_trace(
+        store, metadata={"state": "off", "session_id": 0, "events": 1, "dropped": 0}
+    )
+    store.append_bytes("raw/response.bin", b"raw")
+    for control in (
+        "trace/desired.state", "trace/control/control-123.cmd",
+        "trace/control/status-123.state", "trace/.snapshots/ignored.bin",
+        "trace/traces/123_0.jsonl.meta.json.tmp",
+    ):
+        store.append_bytes(control, b"on")
+    before = {p: p.read_bytes() for p in session.path.rglob("*") if p.is_file()}
+
+    index_path = store.rebuild_index()
+    first = index_path.read_bytes()
+    index = json.loads(first)
+
+    assert list(index["files"]) == ["raw/response.bin", source, source + ".meta.json"]
+    assert index["files"][source]["event_count"] == 1
+    assert index["files"][source]["sha256"] == hashlib.sha256(before[session.path / source]).hexdigest()
+    trace = next(a for a in index["artifacts"] if a["source_path"] == source)
+    assert trace["event_sequence"] == 0
+    assert index["event_loss"] == 0
+    assert index["event_loss_complete"] is True
+    assert index["event_loss_gaps"] == []
+    assert store.rebuild_index().read_bytes() == first
+    assert all(p.read_bytes() == payload for p, payload in before.items())
+
+
+def test_native_dropped_counted_once_across_metadata_aliases_and_snapshots(tmp_path):
+    session, store = _store(tmp_path)
+    metadata = {"state": "off", "session_id": 0, "events": 1, "dropped": 3}
+    source = _native_trace(store, metadata=metadata)
+    alias = source.removesuffix(".jsonl") + ".meta.json"
+    store.append_bytes(alias, json.dumps(metadata).encode() + b"\n")
+    for path in (source, source + ".meta.json", alias):
+        payload = (session.path / path).read_bytes()
+        for kind in ("native", "diagnostic"):
+            store.register_artifact(path, hashlib.sha256(payload).hexdigest(), len(payload), kind)
+
+    index = json.loads(store.rebuild_index().read_text())
+
+    assert index["event_loss"] == 3
+    assert index["event_loss_complete"] is True
+    assert index["event_loss_gaps"] == []
+
+
+def test_finalized_native_trace_without_sidecar_has_loss_completeness_gap(tmp_path):
+    _, store = _store(tmp_path)
+    source = _native_trace(store)
+
+    index = json.loads(store.finalize().read_text())
+
+    assert index["files"][source]["event_count"] == 1
+    assert index["event_loss_complete"] is False
+    assert {"source_path": source, "reason": "missing_native_metadata"} in index["event_loss_gaps"]
+
+
+@pytest.mark.parametrize("remove_source", [False, True])
+def test_registered_native_trace_rebuild_preserves_snapshot(tmp_path, remove_source):
+    session, store = _store(tmp_path)
+    source = _native_trace(
+        store, metadata={"state": "off", "session_id": 0, "events": 1, "dropped": 2}
+    )
+    payload = (session.path / source).read_bytes()
+    record = store.register_artifact(source, hashlib.sha256(payload).hexdigest(), len(payload), "native")
+    if remove_source:
+        (session.path / source).unlink()
+    else:
+        (session.path / source).write_bytes(b'{"q":99}\n{"q":100}\n')
+
+    index = json.loads(store.rebuild_index().read_text())
+    artifact = next(a for a in index["artifacts"] if a["source_path"] == source)
+
+    assert artifact["path"] == record["path"]
+    assert artifact["content_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert artifact["event_count"] == 1
+    assert artifact["event_sequence"] == 0
+    assert index["event_loss"] == 2
+    assert index["event_loss_complete"] is True
+
+
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_incomplete_native_partial_line_and_finalization_loss_are_not_double_counted(tmp_path, with_metadata):
+    session, store = _store(tmp_path)
+    source = _native_trace(
+        store, payload=b'{"q":0}\n{"q":1',
+        metadata={"state": "off", "session_id": 0, "events": 4, "dropped": 3, "detail": "write_error"}
+        if with_metadata else None,
+    )
+    payload = (session.path / source).read_bytes()
+    for kind in ("native", "diagnostic"):
+        store.register_artifact(source, hashlib.sha256(payload).hexdigest(), len(payload), kind)
+    session.mark_incomplete()
+
+    index = json.loads(store.rebuild_index().read_text())
+
+    assert index["files"][source]["event_count"] == 1
+    # Three unrecorded events (one malformed) plus three dropped, or just the malformed line.
+    assert index["event_loss"] == (6 if with_metadata else 1)
+    assert index["event_loss_complete"] is False
+    reason = "native_write_error" if with_metadata else "missing_native_metadata"
+    assert {"source_path": source, "reason": reason} in index["event_loss_gaps"]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "reason"),
+    [
+        ({"state": "on", "session_id": 0, "events": 1, "dropped": 2}, "native_not_finalized"),
+        ({"state": "off", "session_id": 0, "events": 1}, "invalid_native_metadata"),
+    ],
+)
+def test_native_metadata_gaps_are_explicit(tmp_path, metadata, reason):
+    _, store = _store(tmp_path)
+    source = _native_trace(store, metadata=metadata)
+
+    index = json.loads(store.rebuild_index().read_text())
+
+    assert index["event_loss_complete"] is False
+    assert {"source_path": source, "reason": reason} in index["event_loss_gaps"]
+    if "dropped" in metadata:
+        assert index["event_loss"] == metadata["dropped"]
+
+
 def test_append_jsonl_preserves_raw_value(tmp_path):
     session, store = _store(tmp_path)
 
