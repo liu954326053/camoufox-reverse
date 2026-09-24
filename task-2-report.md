@@ -2,25 +2,32 @@
 
 ## 状态
 
-已完成 Task 2 review 中的 P1/P2 修复。实现提交：`9c31fff`（`fix: harden raw evidence immutability and recovery`）。
+snapshot hardening 已完成并验证。注册 artifact 的 validation-to-registry
+替换窗口已通过稳定 copy snapshot 闭合。
 
-## 修复项
+## 统一 Schema
 
-1. `rebuild_index()` 在 session manifest 为 `complete` 时拒绝写入，保留既有 index。
-2. artifact 写入改为基于 POSIX directory fd 的逐级 `openat`/`mkdirat` 语义，父目录和最终文件均使用 `O_NOFOLLOW`，消除普通 symlink/TOCTOU 路径替换窗口。
-3. registry 先 fsync 追加，manifest 更新失败时保留 registry 作为恢复来源；后续 `rebuild_index()` 会 reconciliation manifest，并覆盖 manifest 写入故障注入测试。
-4. `register_artifact()` 必须打开实际 regular file，并校验声明的 `size` 与 SHA-256。
-5. artifact sort 增加 kind、size、content hash、字节数、事件数及 canonical JSON 作为完整 tie-breaker。
-6. 增加公开 `EvidenceStore.finalize()`，先 flush/rebuild index，再调用 `ReverseSession.close()`；`EvidenceStore.close()` 作为兼容别名，明确完整收尾入口。
+1. 唯一隐藏目录为 `raw/.snapshots/`。
+2. registry/index 的注册 artifact 使用
+   `path=raw/.snapshots/<sha256(source_path + digest)>.bin`，并保留
+   `source_path=原始 raw 路径`。
+3. snapshot 从锁内已验证的源 fd 复制，关闭写入后重新从 snapshot fd 校验
+   inode identity、size 和 SHA-256；完成后 write-protect。
+4. `index.files` 只记录逻辑 source 的当前状态，隐藏 snapshot 不参与普通 raw
+   扫描；重建注册 artifact 只读取稳定 snapshot。
+5. registry 按 `source_path` 归组，排序首键为逻辑 source path，继续使用完整
+   tie-breaker 保证确定性。
+
+## 竞态回归
+
+回归测试在最终源校验后、registry append 前替换原路径，证明 registry/index
+仍绑定已观察字节；source 当前 hash 单独出现在 `index.files`，snapshot 不会被
+列入普通文件列表。snapshot 复制或 open-fd 校验失败时注册拒绝，不产生 stale
+成功 artifact。
 
 ## 验证
 
-- `python3 -m pytest tests/test_reverse_evidence.py -q`：`17 passed`
-- `python3 -m pytest tests/test_reverse_evidence.py tests/test_reverse_project.py -q`：`62 passed`
-- `python3 -m pytest tests/test_reverse_evidence.py tests/test_reverse_launch.py tests/test_reverse_mcp_contract.py -q`：`48 passed`
+- `python3 -m pytest tests/test_reverse_evidence.py -q`：`26 passed`
+- `python3 -m pytest -q`：`296 passed, 4 skipped`
+- `py_compile`：通过
 - `git diff --check`：通过
-
-## Concerns
-
-- 直接调用 `ReverseSession.close()` 仍只负责 manifest 生命周期，不会自动生成 evidence index；调用方应使用 `EvidenceStore.finalize()` 或 `EvidenceStore.close()` 完成 evidence session 收尾。
-- 本次未修改 CLI、launch 或 `reverse_project.py`；工作区中与 Task 6 相关的未跟踪文件未纳入提交。

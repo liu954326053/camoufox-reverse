@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover
 
 PathLike = Union[str, os.PathLike[str]]
 _REGISTRY_PATH = "raw/artifacts.jsonl"
+_SNAPSHOT_DIR = "raw/.snapshots"
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
@@ -123,6 +124,20 @@ class EvidenceStore:
             raise EvidenceError("Artifact path must stay inside the session")
         return candidate.as_posix(), parts
 
+    @staticmethod
+    def _is_snapshot_path(relative: str) -> bool:
+        return relative == _SNAPSHOT_DIR or relative.startswith(f"{_SNAPSHOT_DIR}/")
+
+    @classmethod
+    def _reject_snapshot_path(cls, relative: str) -> None:
+        if cls._is_snapshot_path(relative):
+            raise EvidenceError("Snapshot paths are managed internally")
+
+    @staticmethod
+    def _snapshot_relative(source_path: str, sha256: str) -> str:
+        snapshot_id = hashlib.sha256((source_path + sha256).encode("utf-8")).hexdigest()
+        return f"{_SNAPSHOT_DIR}/{snapshot_id}.bin"
+
     def _open_directory(self, parent_fd: int, name: str, create: bool) -> int:
         try:
             descriptor = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
@@ -214,6 +229,7 @@ class EvidenceStore:
 
     def _append_unlocked(self, relative_path: PathLike, data: bytes) -> str:
         normalized, parts = self._parts(relative_path)
+        self._reject_snapshot_path(normalized)
         descriptor = self._open_relative(
             parts,
             os.O_WRONLY | os.O_APPEND | os.O_CREAT,
@@ -287,6 +303,86 @@ class EvidenceStore:
             raise EvidenceError("Cannot hash evidence file") from exc
         return size, digest.hexdigest()
 
+    @classmethod
+    def _copy_fd(cls, source: int, destination: int) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            os.lseek(source, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(source, 1024 * 1024)
+                if not chunk:
+                    break
+                cls._write_all(destination, chunk)
+                size += len(chunk)
+                digest.update(chunk)
+        except OSError as exc:
+            raise EvidenceError("Cannot create evidence snapshot") from exc
+        return size, digest.hexdigest()
+
+    def _snapshot_fd(
+        self,
+        descriptor: int,
+        expected_size: int,
+        expected_hash: str,
+        source_path: str,
+    ) -> str:
+        raw_fd = self._open_directory(self._root_fd, "raw", create=False)
+        snapshot_fd = self._open_directory(raw_fd, ".snapshots", create=True)
+        relative = self._snapshot_relative(source_path, expected_hash)
+        name = relative.rsplit("/", 1)[1]
+        target = None
+        created = False
+        try:
+            try:
+                target = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                    0o600,
+                    dir_fd=snapshot_fd,
+                )
+                created = True
+            except FileExistsError:
+                pass
+            if target is not None:
+                copied_size, copied_hash = self._copy_fd(descriptor, target)
+                if copied_size != expected_size or copied_hash != expected_hash:
+                    raise EvidenceError("Artifact snapshot changed during registration")
+                os.fchmod(target, stat.S_IRUSR)
+                os.fsync(target)
+                os.fsync(snapshot_fd)
+
+            parts = tuple(relative.split("/"))
+            with self._opened_relative(parts, os.O_RDONLY) as (snapshot, parent_fd):
+                before_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                before_fd = os.fstat(snapshot)
+                if not stat.S_ISREG(before_fd.st_mode) or not stat.S_ISREG(before_path.st_mode):
+                    raise EvidenceError("Artifact snapshot must be a regular file")
+                if not self._same_file_observation(before_fd, before_path):
+                    raise EvidenceError("Artifact snapshot was replaced during validation")
+                actual_size, actual_hash = self._digest_fd(snapshot)
+                after_fd = os.fstat(snapshot)
+                after_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+                if not self._same_file_observation(before_fd, after_fd) or not self._same_file_observation(
+                    before_fd, after_path
+                ):
+                    raise EvidenceError("Artifact snapshot was replaced during validation")
+            if actual_size != expected_size or actual_hash != expected_hash:
+                raise EvidenceError("Artifact snapshot metadata does not match observed bytes")
+            return relative
+        except Exception:
+            if created:
+                try:
+                    os.unlink(name, dir_fd=snapshot_fd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if target is not None:
+                os.close(target)
+            os.close(snapshot_fd)
+            os.close(raw_fd)
+
     @staticmethod
     def _identity(file_stat: os.stat_result) -> tuple[int, int]:
         return file_stat.st_dev, file_stat.st_ino
@@ -341,8 +437,9 @@ class EvidenceStore:
     def register_artifact(
         self, relative_path: PathLike, sha256: str, size: int, kind: str
     ) -> dict[str, Any]:
-        """Register metadata after validating the current regular file contents."""
+        """Register metadata against a stable copy of the observed regular file."""
         normalized, parts = self._parts(relative_path)
+        self._reject_snapshot_path(normalized)
         record = self._registration(normalized, sha256, size, kind)
         with self._evidence_lock():
             self._ensure_open()
@@ -367,6 +464,11 @@ class EvidenceStore:
                     raise EvidenceError(
                         "Registered artifact metadata does not match file contents"
                     )
+                snapshot_path = self._snapshot_fd(
+                    descriptor, actual_size, actual_hash, normalized
+                )
+                record = self._registration(snapshot_path, sha256, size, kind)
+                record["source_path"] = normalized
                 payload = json.dumps(
                     record, ensure_ascii=False, separators=(",", ":")
                 ).encode("utf-8") + b"\n"
@@ -409,13 +511,16 @@ class EvidenceStore:
             if not path.is_file() or path.is_symlink():
                 continue
             relative = path.relative_to(self.root).as_posix()
-            if relative == _REGISTRY_PATH or path.name.startswith("."):
+            raw_relative = path.relative_to(self.raw_dir)
+            if relative == _REGISTRY_PATH or any(
+                part.startswith(".") for part in raw_relative.parts
+            ):
                 continue
             files.append((relative, tuple(relative.split("/"))))
         return files
 
     def _file_snapshot(
-        self, relative: str, parts: tuple[str, ...]
+        self, relative: str, parts: tuple[str, ...], *, event_source: str | None = None
     ) -> tuple[int, str, int, int, list[int]]:
         with self._opened_relative(parts, os.O_RDONLY) as (descriptor, parent_fd):
             before_path = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
@@ -424,7 +529,7 @@ class EvidenceStore:
                 raise EvidenceError("Raw evidence path is not a regular file")
             if not self._same_file_observation(before_fd, before_path):
                 raise EvidenceError(f"Raw evidence path was replaced: {relative}")
-            if relative.endswith(".jsonl"):
+            if (event_source or relative).endswith(".jsonl"):
                 payload = self._read_fd(descriptor)
                 byte_count = len(payload)
                 content_hash = hashlib.sha256(payload).hexdigest()
@@ -506,10 +611,47 @@ class EvidenceStore:
 
         registered: dict[str, list[dict[str, Any]]] = {}
         for record in records:
-            registered.setdefault(record["path"], []).append(record)
+            source = record.get("source_path")
+            if not isinstance(source, str):
+                raise EvidenceError("Registered artifact source path is invalid")
+            source, source_parts = self._parts(source)
+            self._reject_snapshot_path(source)
+            if source_parts[0] != "raw":
+                raise EvidenceError("Registered artifact source path must be under raw")
+            registered.setdefault(source, []).append(record)
         files: dict[str, dict[str, Any]] = {}
         artifacts: list[dict[str, Any]] = []
         malformed_total = 0
+
+        def add_registered_artifact(entry: dict[str, Any], source: str) -> None:
+            nonlocal malformed_total
+            snapshot = entry.get("path")
+            snapshot_normalized, snapshot_parts = self._parts(snapshot)
+            if snapshot_normalized != snapshot or not self._is_snapshot_path(snapshot):
+                raise EvidenceError("Registered artifact snapshot path is invalid")
+            if snapshot != self._snapshot_relative(source, entry.get("sha256", "")):
+                raise EvidenceError("Registered artifact snapshot identity is invalid")
+            observed = self._file_snapshot(
+                snapshot,
+                snapshot_parts,
+                event_source=source,
+            )
+            observed_bytes, observed_hash, observed_events, observed_malformed, observed_sequences = observed
+            if entry.get("size") != observed_bytes or entry.get("sha256") != observed_hash:
+                raise EvidenceError(f"Registered artifact metadata no longer matches: {source}")
+            malformed_total += observed_malformed
+            item = dict(entry)
+            item["source_path"] = source
+            item.update(
+                {
+                    "bytes": observed_bytes,
+                    "event_count": observed_events,
+                    "content_sha256": observed_hash,
+                    "event_sequence": min(observed_sequences) if observed_sequences else None,
+                }
+            )
+            artifacts.append(item)
+
         for relative, parts in self._raw_files():
             byte_count, content_hash, event_count, malformed, sequences = self._file_snapshot(
                 relative, parts
@@ -520,39 +662,36 @@ class EvidenceStore:
                 "event_count": event_count,
                 "sha256": content_hash,
             }
-            entries = registered.get(relative) or [
-                {
-                    "path": relative,
-                    "sha256": content_hash,
-                    "size": byte_count,
-                    "kind": "jsonl" if relative.endswith(".jsonl") else "raw",
-                }
-            ]
-            for entry in entries:
-                if entry.get("size") != byte_count or entry.get("sha256") != content_hash:
-                    raise EvidenceError(
-                        f"Registered artifact metadata no longer matches: {relative}"
-                    )
-                item = dict(entry)
-                item.update(
+            entries = registered.get(relative)
+            if entries:
+                for entry in entries:
+                    add_registered_artifact(entry, relative)
+            else:
+                artifacts.append(
                     {
+                        "path": relative,
+                        "sha256": content_hash,
+                        "size": byte_count,
+                        "kind": "jsonl" if relative.endswith(".jsonl") else "raw",
+                        "source_path": relative,
                         "bytes": byte_count,
                         "event_count": event_count,
                         "content_sha256": content_hash,
                         "event_sequence": min(sequences) if sequences else None,
                     }
                 )
-                artifacts.append(item)
         for relative, entries in registered.items():
             if relative in files:
                 continue
-            raise EvidenceError(f"Registered artifact disappeared: {relative}")
+            for entry in entries:
+                add_registered_artifact(entry, relative)
         artifacts.sort(
             key=lambda item: (
-                item.get("path", ""),
+                item.get("source_path", item.get("path", "")),
                 item.get("event_sequence") is None,
                 item.get("event_sequence") if item.get("event_sequence") is not None else 0,
                 item.get("kind", ""),
+                item.get("path", ""),
                 item.get("size", 0),
                 item.get("sha256", ""),
                 item.get("content_sha256") or "",
@@ -579,6 +718,10 @@ class EvidenceStore:
         self._ensure_open()
         paths = [parts for _, parts in self._raw_files()]
         paths.append(tuple(_REGISTRY_PATH.split("/")))
+        for record in self._read_registry():
+            snapshot = record.get("path")
+            if isinstance(snapshot, str) and self._is_snapshot_path(snapshot):
+                paths.append(self._parts(snapshot)[1])
         for parts in paths:
             descriptor = self._open_existing(parts)
             if descriptor is None:
@@ -590,6 +733,7 @@ class EvidenceStore:
             finally:
                 os.close(descriptor)
         _fsync_directory(self.raw_dir)
+        _fsync_directory(self.raw_dir / ".snapshots")
         _fsync_directory(self.root)
 
     def flush(self) -> None:

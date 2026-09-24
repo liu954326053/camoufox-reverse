@@ -67,12 +67,12 @@ def test_register_artifact_updates_registry_without_redacting_data(tmp_path):
     store.append_bytes(path, payload)
     digest = hashlib.sha256(payload).hexdigest()
 
-    store.register_artifact(path, digest, len(payload), "script")
+    record = store.register_artifact(path, digest, len(payload), "script")
 
     manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["artifacts"] == [
-        {"path": path, "sha256": digest, "size": len(payload), "kind": "script"}
-    ]
+    assert manifest["artifacts"] == [record]
+    assert record["path"].startswith("raw/.snapshots/")
+    assert record["source_path"] == path
     assert "raw-secret-fixture" in (session.path / path).read_bytes().decode()
 
 
@@ -109,11 +109,15 @@ def test_rebuild_index_is_deterministic_and_does_not_mutate_raw_files(tmp_path):
 
     index = json.loads(first_payload)
     assert index["event_loss"] == 0
-    assert [item["path"] for item in index["artifacts"]] == [
+    assert [item["source_path"] for item in index["artifacts"]] == [
         "raw/a.bin",
         "raw/a.jsonl",
         "raw/z.bin",
     ]
+    assert all(
+        item["path"] == item["source_path"] or item["path"].startswith("raw/.snapshots/")
+        for item in index["artifacts"]
+    )
     assert index["artifacts"][0]["kind"] == "screenshot"
     assert index["files"]["raw/a.bin"]["bytes"] == len(first)
     assert index["files"]["raw/a.jsonl"]["event_count"] == 1
@@ -207,10 +211,12 @@ def test_registry_is_durable_source_and_rebuild_recovers_manifest_after_write_fa
     index_path = EvidenceStore(session).rebuild_index()
 
     manifest = json.loads(session.manifest_path.read_text(encoding="utf-8"))
-    assert manifest["artifacts"] == [
-        {"path": path, "sha256": digest, "size": len(payload), "kind": "response"}
-    ]
-    assert json.loads(index_path.read_text(encoding="utf-8"))["artifacts"][0]["path"] == path
+    registered = json.loads(
+        (session.path / "raw/artifacts.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert manifest["artifacts"] == [registered]
+    assert registered["source_path"] == path
+    assert json.loads(index_path.read_text(encoding="utf-8"))["artifacts"][0]["path"] == registered["path"]
 
 
 @pytest.mark.parametrize(
@@ -268,6 +274,25 @@ def test_register_artifact_rejects_completed_session_without_writing_registry(tm
         store.register_artifact("raw/late.bin", "0" * 64, 0, "response")
 
     assert not (session.path / "raw/artifacts.jsonl").exists()
+
+
+def test_registered_artifact_keeps_an_observed_snapshot_after_source_replacement(tmp_path):
+    session, store = _store(tmp_path)
+    path = session.path / "raw" / "response.bin"
+    original = b"observed-before-replacement"
+    store.append_bytes("raw/response.bin", original)
+    digest = hashlib.sha256(original).hexdigest()
+    record = store.register_artifact("raw/response.bin", digest, len(original), "response")
+
+    replacement = path.with_name("replacement.bin")
+    replacement.write_bytes(b"different-after-registration")
+    os.replace(replacement, path)
+
+    index = json.loads(store.rebuild_index().read_text(encoding="utf-8"))
+    artifact = next(item for item in index["artifacts"] if item["source_path"] == "raw/response.bin")
+    assert artifact["path"] == record["path"]
+    assert artifact["content_sha256"] == digest
+    assert artifact["path"].startswith("raw/.snapshots/")
 
 
 def test_finalize_builds_index_before_marking_session_complete(tmp_path):
@@ -469,6 +494,56 @@ def test_register_artifact_rejects_path_replacement_after_fd_digest(tmp_path, mo
         )
 
     assert not (session.path / "raw/artifacts.jsonl").exists()
+
+
+def test_register_artifact_snapshots_bytes_before_source_replacement(tmp_path, monkeypatch):
+    session, store = _store(tmp_path)
+    source = "raw/response.bin"
+    source_path = session.path / source
+    observed = b"observed-before-replacement"
+    replacement = b"replacement-after-validation"
+    store.append_bytes(source, observed)
+    original_append = store._append_unlocked
+    replaced = False
+
+    def replace_source_before_registry(relative_path, data):
+        nonlocal replaced
+        if relative_path == "raw/artifacts.jsonl" and not replaced:
+            replacement_path = source_path.with_name("replacement.bin")
+            replacement_path.write_bytes(replacement)
+            replacement_path.replace(source_path)
+            replaced = True
+        return original_append(relative_path, data)
+
+    monkeypatch.setattr(store, "_append_unlocked", replace_source_before_registry)
+    digest = hashlib.sha256(observed).hexdigest()
+
+    record = store.register_artifact(source, digest, len(observed), "response")
+
+    assert record["source_path"] == source
+    expected_snapshot = (
+        "raw/.snapshots/"
+        + hashlib.sha256((source + digest).encode("utf-8")).hexdigest()
+        + ".bin"
+    )
+    assert record["path"] == expected_snapshot
+    snapshot_path = session.path / record["path"]
+    assert snapshot_path.read_bytes() == observed
+    registry = [
+        json.loads(line)
+        for line in (session.path / "raw/artifacts.jsonl").read_text().splitlines()
+    ]
+    assert registry == [record]
+
+    index = json.loads(store.rebuild_index().read_text(encoding="utf-8"))
+    artifact = next(item for item in index["artifacts"] if item["kind"] == "response")
+    assert artifact["path"] == record["path"]
+    assert artifact["source_path"] == source
+    assert artifact["sha256"] == digest
+    assert artifact["size"] == len(observed)
+    assert artifact["content_sha256"] == digest
+    assert index["files"][source]["sha256"] == hashlib.sha256(replacement).hexdigest()
+    assert all("/.snapshots/" not in path for path in index["files"])
 
 
 def test_index_sorting_is_independent_of_raw_file_creation_order(tmp_path):
