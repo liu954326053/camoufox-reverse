@@ -66,14 +66,6 @@ bash mcp/run-client.sh \
 - raw 只追加；分析结果写到 `derived/`、`report/` 或 `indexes/`，不能覆盖 raw。
 - 所有 stdout/stderr 不得出现密码、Cookie、token 或完整代理认证信息。
 
-## 禁止事项
-
-- 不自动填写第三方账号或保存聊天中提供的账号密码。
-- 不绕过验证码、登录挑战、BotGuard 或其它风控防护。
-- 不把浏览器 profile、旧 Cookie 或旧 session 当作默认输入。
-- 不使用 Node、JavaScript 客户端或临时目录代替工程目录；MCP client 使用 Python 标准库。
-- 不上传证据、不遥测、不自动提交 Git。
-
 ## 收尾验收
 
 至少确认：启动缺少 `project_dir` 会失败；新启动生成唯一 session；raw/trace 均在工程目录；关闭后 manifest 是 `complete` 或明确的 `incomplete`；索引可以从 raw 重建；没有文件写到工程目录之外。真实目标页面只在得到授权后访问。
