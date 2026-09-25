@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>opcode seq target fixture (renamed)</title></head>
+<body>
+<script>
+// 第十阶段切片 A 验收靶场：与 opcode-target 相同的 VM 派发逻辑，
+// 但函数与参数全部改名（Du→Xq，l/p/c→aa/bb/cc），模拟混淆器改名。
+// 字面量锚点必然失配；structural 锚点（标识符写 _+）应仍命中。
+var program = [3, 1, 4, 1, 5, 9, 2, 6];
+eval('function Xq(aa,bb,cc){ aa.Y[bb] = cc; }');
+var vm = { Y: {} };
+for (var i = 0; i < program.length; i++) Xq(vm, program[i], i);
+// 一段 while(true) FSM 让循环通道也有料（eval 动态注入）
+eval('var s = 0; while (true) { if (s == 3) break; s++; }');
+</script>
+</body>
+</html>

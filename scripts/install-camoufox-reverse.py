@@ -22,7 +22,14 @@ import re
 
 CAPABILITIES_FILE = "camoufox-reverse-capabilities.json"
 EXPECTED_DISTRIBUTION = "WhiteNightShadow/camoufox-reverse"
-EXPECTED_REVERSE_RELEASE = "reverse.5"
+EXPECTED_UPSTREAM_VERSION = "152.0.4"
+EXPECTED_UPSTREAM_RELEASE = "beta.30"
+EXPECTED_REVERSE_RELEASE = "reverse.9"
+EXPECTED_BROWSER_SELECTOR = (
+    "whitenightshadow/152.0.4-beta.30-reverse.9"
+)
+EXPECTED_STATUS_FIELDS = ["state", "session_id", "events", "dropped", "detail"]
+EXPECTED_METADATA_ARTIFACT = "traces/*.meta.json"
 REQUIRED_TRACE_FEATURES = {
     "async_buffered_io",
     "event_kind",
@@ -31,8 +38,11 @@ REQUIRED_TRACE_FEATURES = {
     "sequence",
     "exclusive_session_files",
     "control_ack",
+    "loss_status",
+    "durable_loss_metadata",
     "utf8_paths",
     "process_scope",
+    "script_exec_events",
 }
 MAX_MEMBERS = 50_000
 MAX_TOTAL_SIZE = 4 * 1024 * 1024 * 1024
@@ -179,6 +189,12 @@ def install_archive(
             raise InstallError(f"invalid reverse_release metadata: {reverse_release!r}")
         if version != asset_match.group("version") or build != asset_match.group("build"):
             raise InstallError("archive filename and version.json do not agree")
+        if version != EXPECTED_UPSTREAM_VERSION or build != EXPECTED_UPSTREAM_RELEASE:
+            raise InstallError(
+                "expected upstream "
+                f"{EXPECTED_UPSTREAM_VERSION}-{EXPECTED_UPSTREAM_RELEASE}, "
+                f"got {version}-{build}"
+            )
         if capabilities.get("schema") != 1:
             raise InstallError("unsupported capability schema")
         if capabilities.get("upstream_version") != f"{version}-{build}":
@@ -187,10 +203,16 @@ def install_archive(
             raise InstallError(
                 f"expected {EXPECTED_REVERSE_RELEASE}, got {reverse_release or 'missing'}"
             )
+        if capabilities.get("browser_selector") != EXPECTED_BROWSER_SELECTOR:
+            raise InstallError("archive has an unexpected browser selector")
         if capabilities.get("property_trace_protocol") != 1:
             raise InstallError("unsupported PropertyTracer protocol")
         if capabilities.get("property_trace_hooks") != 77:
             raise InstallError("archive does not contain the expected 77 trace hooks")
+        if capabilities.get("property_trace_status_fields") != EXPECTED_STATUS_FIELDS:
+            raise InstallError("archive has incomplete PropertyTracer status fields")
+        if capabilities.get("property_trace_metadata_artifact") != EXPECTED_METADATA_ARTIFACT:
+            raise InstallError("archive has an unexpected PropertyTracer metadata artifact")
         features = capabilities.get("property_trace_features")
         if not isinstance(features, list):
             raise InstallError("archive does not declare PropertyTracer feature metadata")

@@ -89,7 +89,7 @@ from camoufox.reverse_launch import reverse_launch_options
 options, session = reverse_launch_options(
     project_dir="/absolute/project",
     proxy="http://127.0.0.1:7890",
-    browser_version="whitenightshadow/152.0.4-beta.30-reverse.5",
+    browser_version="whitenightshadow/152.0.4-beta.30-reverse.6",
     trace_profile="targeted",
 )
 ```
@@ -571,7 +571,7 @@ Add README instructions using the installed reverse selector and local proxy:
 reverse-browser launch \
   --project-dir /absolute/path/to/project \
   --proxy http://127.0.0.1:7890 \
-  --browser-version whitenightshadow/152.0.4-beta.30-reverse.5 \
+  --browser-version whitenightshadow/152.0.4-beta.30-reverse.6 \
   --trace-profile targeted
 ```
 

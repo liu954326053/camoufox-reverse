@@ -39,7 +39,7 @@ Successful responses may contain only these top-level fields:
   "status": "ok",
   "session_id": "session-123",
   "session_dir": "/absolute/project/.reverse-browser/sessions/session-123",
-  "browser_version": "152.0",
+  "browser_version": "whitenightshadow/152.0.4-beta.30-reverse.8",
   "count": 0,
   "artifacts": {
     "manifest": "/absolute/project/.reverse-browser/sessions/session-123/manifest.json"
@@ -87,7 +87,7 @@ Request:
 {
   "project_dir": "/absolute/project",
   "proxy": "http://127.0.0.1:7890",
-  "browser_version": "152.0",
+  "browser_version": "whitenightshadow/152.0.4-beta.30-reverse.8",
   "trace_profile": "targeted",
   "capture_profile": "raw"
 }

@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>xorigin parent</title></head>
+<body>
+<!-- 第十阶段切片 D 验收靶场：跨域 iframe（不同端口=不同源）。
+     子 frame 的循环轨迹只能经 postMessage drain 桥聚合。 -->
+<script>
+// 父页面自己也跑一段循环，验证顶层与跨域 frame 互不干扰
+eval('var p = 0; while (true) { if (p == 2) break; p++; }');
+</script>
+<iframe id="f" src="http://127.0.0.1:8897/child.html"></iframe>
+</body>
+</html>

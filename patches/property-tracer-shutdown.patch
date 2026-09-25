@@ -1,0 +1,18 @@
+diff --git a/xpcom/base/AppShutdown.cpp b/xpcom/base/AppShutdown.cpp
+--- a/xpcom/base/AppShutdown.cpp
++++ b/xpcom/base/AppShutdown.cpp
+@@ -5,4 +5,5 @@
+ #include "ShutdownPhase.h"
++#include "PropertyTracer.hpp"
+ #ifdef XP_WIN
+ #  include <windows.h>
+ #  include "mozilla/PreXULSkeletonUI.h"
+@@ -298,4 +299,8 @@
+ void AppShutdown::DoImmediateExit(int aExitCode) {
++  // QuickExit and fast shutdown bypass static destructors. Drain native trace
++  // producers and publish their final metadata/ACK before terminating.
++  camou::PropertyTracer::Instance().Shutdown();
++
+ #ifdef XP_WIN
+   HANDLE process = ::GetCurrentProcess();
+   if (::TerminateProcess(process, aExitCode)) {

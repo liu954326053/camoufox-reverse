@@ -1,0 +1,2 @@
+[console_scripts]
+camoufox-reverse-mcp-client = camoufox_reverse_mcp_client.__main__:main

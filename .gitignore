@@ -80,3 +80,10 @@ node_modules/
 proxies.txt
 checks-bundle.js
 .env
+
+# Reverse project local state & evidence (never commit)
+/artifacts/
+/.mozbuild-reverse/
+/.web-reverse-tool-dir
+/dist-reverse.*/
+/task-*-report.md

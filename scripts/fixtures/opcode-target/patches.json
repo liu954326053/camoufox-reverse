@@ -1,0 +1,3 @@
+[{"name": "seq-register",
+  "pattern": "function Du\\((\\w+),(\\w+),(\\w+)\\)\\{",
+  "replacement": "function Du($1,$2,$3){(globalThis.__mcp_vm_rec&&globalThis.__mcp_vm_rec('Du',[$2]));"}]

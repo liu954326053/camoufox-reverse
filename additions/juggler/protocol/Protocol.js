@@ -217,6 +217,16 @@ networkTypes.ResourceTiming = {
   responseStart: t.Number,
 };
 
+// reverse8 phase12: one JS stack frame of the request initiator, captured
+// in the content process at channel open time (see InitiatorStackCollector).
+networkTypes.InitiatorStackFrame = {
+  functionName: t.Nullable(t.String),
+  filename: t.Nullable(t.String),
+  lineNumber: t.Number,
+  columnNumber: t.Number,
+  asyncCause: t.Optional(t.Nullable(t.String)),
+};
+
 const Browser = {
   targets: ['browser'],
 
@@ -518,6 +528,10 @@ const Network = {
       navigationId: t.Optional(t.String),
       cause: t.String,
       internalCause: t.String,
+      // reverse8 phase12: engine-level initiator JS stack (content-process
+      // capture, zero page-world pollution). Absent when the channel was not
+      // opened synchronously from page JS.
+      initiatorStack: t.Optional(t.Array(networkTypes.InitiatorStackFrame)),
     },
     'responseReceived': {
       securityDetails: t.Nullable(networkTypes.SecurityDetails),

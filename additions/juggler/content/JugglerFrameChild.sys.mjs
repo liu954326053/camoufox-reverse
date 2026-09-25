@@ -76,6 +76,7 @@ export class JugglerFrameChild extends JSWindowActorChild {
     topBrowingContextToAgents.delete(this.browsingContext);
 
     agents.channel.resetTransport();
+    agents.initiatorStackCollector?.dispose();
     agents.pageAgent.dispose();
     agents.frameTree.dispose();
   }

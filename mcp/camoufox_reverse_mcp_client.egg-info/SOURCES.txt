@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+camoufox_reverse_mcp_client/__init__.py
+camoufox_reverse_mcp_client/__main__.py
+camoufox_reverse_mcp_client/client.py
+camoufox_reverse_mcp_client.egg-info/PKG-INFO
+camoufox_reverse_mcp_client.egg-info/SOURCES.txt
+camoufox_reverse_mcp_client.egg-info/dependency_links.txt
+camoufox_reverse_mcp_client.egg-info/entry_points.txt
+camoufox_reverse_mcp_client.egg-info/top_level.txt
+tests/test_client.py

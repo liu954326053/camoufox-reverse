@@ -204,8 +204,32 @@ class AsyncReverseBrowser:
             # The dictionary property omits security headers and folds duplicates.
             meta[key] = await source.headers_array()
         except Exception as error:
-            meta[key + "_error"] = str(error)
-            self._record_error(key, error, request_id=meta["id"])
+            # Firefox's InterceptableRequest calls setRawRequestHeaders(null),
+            # so its raw header result is the same ordered array delivered in
+            # the request event. Keep that array if the later channel lookup
+            # loses a race with navigation/disposal; never use headers (dict).
+            impl = getattr(source, "_impl_obj", None)
+            initial = getattr(impl, "_initializer", {})
+            headers = initial.get("headers") if isinstance(initial, dict) else None
+            overrides = getattr(impl, "_fallback_overrides", None)
+            header_override = getattr(overrides, "headers", None)
+            if key == "request_headers" and header_override is not None:
+                # A route may have changed headers while the channel call was
+                # pending. Neither the initial array nor the override dict
+                # proves the final ordered wire headers in that case.
+                meta[key + "_override_unverified"] = True
+                meta[key + "_error"] = str(error)
+                self._record_error(key, error, request_id=meta["id"])
+            elif key == "request_headers" and isinstance(headers, list) and all(
+                isinstance(header, dict) and isinstance(header.get("name"), str)
+                and isinstance(header.get("value"), str) for header in headers
+            ):
+                meta[key] = [dict(header) for header in headers]
+                meta[key + "_source"] = "firefox_request_event"
+                meta[key + "_lookup_error"] = str(error)
+            else:
+                meta[key + "_error"] = str(error)
+                self._record_error(key, error, request_id=meta["id"])
         finally:
             self._dirty_requests.add(meta["id"])
 
@@ -220,7 +244,11 @@ class AsyncReverseBrowser:
             return
         self._on_request(request)
         request_id = self._request_id(request)
-        self._request_meta[request_id]["failure"] = request.failure
+        meta = self._request_meta[request_id]
+        meta["failure"] = request.failure
+        meta["response_complete"] = False
+        if meta.get("body_availability") == "captured":
+            meta["body_availability"] = "captured_partial"
         self._dirty_requests.add(request_id)
 
     async def _capture_response(self, response: Any) -> None:
@@ -241,13 +269,22 @@ class AsyncReverseBrowser:
                 meta["body_availability"] = "empty_by_header"
             else:
                 body = await response.body()
-                meta["body_availability"] = "captured"
+                meta["response_complete"] = not bool(meta.get("failure"))
+                meta["body_availability"] = "captured_partial" if meta.get("failure") else "captured"
             self.write_artifact(f"raw/network/{request_id}/response.body", body, "response-body")
             if meta.get("script"):
                 self.write_artifact(f"raw/scripts/{request_id}.js", body, "script")
         except Exception as error:
             meta["body_availability"] = "unavailable"
             meta["response_body_error"] = str(error)
+            # 第四阶段 Task 3：redirect 响应无 body 是浏览器固有限制，
+            # 把缺口自描述化——记录跳转目标，离线可重建请求链
+            location = next(
+                (h["value"] for h in meta.get("response_headers", [])
+                 if h["name"].lower() == "location"), None)
+            if meta.get("status") in {301, 302, 303, 307, 308} and location:
+                meta["body_availability"] = "redirect"
+                meta["redirect_location"] = location
             self._record_error("response_body", error, request_id=request_id)
         finally:
             self._dirty_requests.add(request_id)

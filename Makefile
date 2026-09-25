@@ -16,7 +16,7 @@ pacman := python python-pip p7zip go msitools wget aria2 sqlite
         build-launcher check-arch revert edits run bootstrap mozbootstrap dir \
         package-linux package-macos package-windows vcredist_arch patch unpatch \
         workspace check-arg edit-cfg ff-dbg tests update-ubo-assets generate-assets-car \
-        setup-macos-sdk test-trace-injector
+        setup-macos-sdk test-trace-injector check-reverse-config
 
 help:
 	@echo "Available targets:"
@@ -166,10 +166,16 @@ check-arch:
 		exit 1; \
 	fi
 
+check-reverse-config:
+	python3 scripts/validate_reverse_build.py \
+		--version $(version) \
+		--release $(release) \
+		--reverse-release $(reverse_release)
+
 build-launcher: check-arch
 	cd legacy/launcher && bash build.sh $(arch) $(os)
 
-package-linux:
+package-linux: check-reverse-config
 	python3 scripts/package.py linux \
 		--includes \
 			settings/chrome.css \
@@ -182,7 +188,7 @@ package-linux:
 		--arch $(arch) \
 		--fonts windows macos linux
 
-package-macos:
+package-macos: check-reverse-config
 	python3 scripts/package.py macos \
 		--includes \
 			settings/chrome.css \
@@ -194,7 +200,7 @@ package-macos:
 		--arch $(arch) \
 		--fonts windows linux
 
-package-windows:
+package-windows: check-reverse-config
 	python3 scripts/package.py windows \
 		--includes \
 			settings/chrome.css \

@@ -22,6 +22,7 @@ juggler.jar:
   content/JugglerFrameChild.jsm (content/JugglerFrameChild.jsm)
   content/JugglerFrameChild.sys.mjs (content/JugglerFrameChild.sys.mjs)
   content/content/main.js (content/main.js)
+  content/content/InitiatorStackCollector.js (content/InitiatorStackCollector.js)
   content/content/FrameTree.js (content/FrameTree.js)
   content/content/PageAgent.js (content/PageAgent.js)
   content/content/Runtime.js (content/Runtime.js)

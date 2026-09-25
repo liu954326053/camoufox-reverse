@@ -8,6 +8,7 @@ from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 
 from .reverse_project import ReverseProject, ReverseSession
+from .reverse_compat import BROWSER_SELECTOR
 from .utils import launch_options
 
 
@@ -164,14 +165,14 @@ def reverse_launch_options(
         )
         if proxy is not None:
             launch_kwargs["proxy"] = normalized_proxy
-        if browser_version is not None:
-            launch_kwargs["browser"] = browser_version
+        selected_browser = browser_version or BROWSER_SELECTOR
+        launch_kwargs["browser"] = selected_browser
 
         options = launch_options(**launch_kwargs)
         session.mark_running(
             trace_profile=trace_profile,
             trace_enabled=enable_trace,
-            browser_version=browser_version or launch_kwargs.get("browser"),
+            browser_version=selected_browser,
             proxy=(
                 {
                     "server": normalized_proxy["server"],

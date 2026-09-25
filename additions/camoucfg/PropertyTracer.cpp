@@ -142,6 +142,7 @@ void MkdirP(const std::string& path) {
 void PropertyTracer::Initialize(const std::string& baseDir,
                                 const std::vector<std::string>& objects,
                                 uint32_t maxEventsPerSession) {
+  std::lock_guard<std::mutex> lifecycleLock(mLifecycleMutex);
   if (mInitialized) return;
 
   // Build paths
@@ -200,22 +201,21 @@ void PropertyTracer::Initialize(const std::string& baseDir,
 }
 
 void PropertyTracer::Shutdown() {
+  std::lock_guard<std::mutex> lifecycleLock(mLifecycleMutex);
   if (!mInitialized) return;
-  mEnabled.store(false, std::memory_order_release);
   mStop.store(true);
   mBufferCv.notify_all();
 
+  // Let an in-flight control transition finish before disabling recording.
+  // Otherwise its off branch could acknowledge before the final drain.
   if (mControlThread.joinable()) mControlThread.join();
+  StopSession();
   if (mFlushThread.joinable()) mFlushThread.join();
 
-  StopSession();
-
-  // Clean up control file
+  // Retired producers cannot answer a later off command. Keep their final ACK
+  // (including loss/write errors) available for the run's evidence collector.
   if (!mControlPath.empty()) {
     UnlinkPath(mControlPath);
-  }
-  if (!mStatusPath.empty()) {
-    UnlinkPath(mStatusPath);
   }
 
   mInitialized = false;
@@ -370,8 +370,8 @@ void PropertyTracer::WriteStatus(const char* state, const char* detail) {
 #endif
 }
 
-void PropertyTracer::WriteSessionMetadata(const char* state, const char* detail) {
-  if (mCurrentMetadataPath.empty()) return;
+bool PropertyTracer::WriteSessionMetadata(const char* state, const char* detail) {
+  if (mCurrentMetadataPath.empty()) return false;
 
   uint32_t events = 0;
   uint32_t dropped = 0;
@@ -383,7 +383,7 @@ void PropertyTracer::WriteSessionMetadata(const char* state, const char* detail)
 
   const std::string temporaryPath = mCurrentMetadataPath + ".tmp";
   std::ofstream file(NativePath(temporaryPath), std::ios::trunc);
-  if (!file) return;
+  if (!file) return false;
   file << "{\"state\":";
   std::string jsonState;
   AppendJsonString(jsonState, state ? state : "");
@@ -397,20 +397,22 @@ void PropertyTracer::WriteSessionMetadata(const char* state, const char* detail)
   }
   file << "}\n";
   file.flush();
+  file.close();
   if (!file) {
     UnlinkPath(temporaryPath);
-    return;
+    return false;
   }
-  file.close();
 
   std::error_code error;
   std::filesystem::rename(NativePath(temporaryPath),
                           NativePath(mCurrentMetadataPath), error);
   if (error) UnlinkPath(temporaryPath);
+  return !error;
 }
 
 void PropertyTracer::StartNewSession() {
   std::lock_guard<std::mutex> lock(mSessionMutex);
+  if (mStop.load()) return;
   if (mCurrentFd >= 0) return;  // already open
 
   // Use parent PID for content processes (they share the same trace dir)
@@ -466,12 +468,17 @@ void PropertyTracer::StopSession() {
       fprintf(stderr, "PropertyTracer: failed to sync trace file: %s\n",
               strerror(errno));
     }
-    close(mCurrentFd);
+    if (close(mCurrentFd) != 0) {
+      mWriteFailed.store(true, std::memory_order_release);
+    }
     mCurrentFd = -1;
-    WriteSessionMetadata("off",
-                         mWriteFailed.load(std::memory_order_acquire)
-                             ? "write_error"
-                             : nullptr);
+    if (!WriteSessionMetadata("off",
+                              mWriteFailed.load(std::memory_order_acquire)
+                                  ? "write_error"
+                                  : nullptr)) {
+      mWriteFailed.store(true, std::memory_order_release);
+      fprintf(stderr, "PropertyTracer: failed to publish session metadata\n");
+    }
     mCurrentMetadataPath.clear();
   }
   uint32_t dropped = 0;

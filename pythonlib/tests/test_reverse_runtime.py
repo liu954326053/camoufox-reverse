@@ -3,6 +3,7 @@ import gc
 import json
 import weakref
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -386,6 +387,81 @@ async def test_empty_binary_body_is_preserved(runtime_factory):
     assert runtime.store.files[f'raw/network/{row["id"]}/request.body'] == b""
     assert runtime.store.files[f'raw/network/{row["id"]}/response.body'] == b""
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_response_retains_partial_bytes_and_transport_failure(runtime_factory):
+    runtime = await runtime_factory().__aenter__()
+    request = FakeRequest()
+    runtime._on_request(request)
+    runtime._on_response(FakeResponse(request, b"partial\x00\xff"))
+    runtime._on_request_failed(request)
+    await runtime.drain()
+    row = metadata(runtime)[0]
+    assert runtime.store.files[f'raw/network/{row["id"]}/response.body'] == b"partial\x00\xff"
+    assert row["failure"] == request.failure
+    assert row["body_availability"] == "captured_partial"
+    assert row["response_complete"] is False
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_request_headers_survive_protocol_lookup_failure_without_folding(runtime_factory):
+    runtime = await runtime_factory().__aenter__()
+    headers = [{"name": "Cookie", "value": "raw-cookie"},
+               {"name": "X-Duplicate", "value": "one"},
+               {"name": "X-Duplicate", "value": "two"}]
+
+    class Request(FakeRequest):
+        _impl_obj = SimpleNamespace(_initializer={"headers": headers})
+
+        async def headers_array(self):
+            raise RuntimeError("request disposed during navigation")
+
+    runtime._on_request_failed(Request())
+    result = await runtime.close()
+    row = metadata(runtime)[0]
+    assert row["request_headers"] == headers
+    assert row["request_headers_source"] == "firefox_request_event"
+    assert row["request_headers_lookup_error"] == "request disposed during navigation"
+    assert result["status"] == "closed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{"X-Changed": "after-route"}, {}])
+async def test_header_override_during_failed_lookup_does_not_use_old_headers(runtime_factory, overrides):
+    runtime = await runtime_factory().__aenter__()
+
+    class Request(FakeRequest):
+        _impl_obj = SimpleNamespace(
+            _initializer={"headers": [{"name": "X-Changed", "value": "before-route"}]},
+            _fallback_overrides=SimpleNamespace(headers=None),
+        )
+
+        async def headers_array(self):
+            self._impl_obj._fallback_overrides.headers = overrides
+            raise RuntimeError("request disposed after route override")
+
+    runtime._on_request_failed(Request())
+    result = await runtime.close()
+    row = metadata(runtime)[0]
+    assert result["status"] == "incomplete"
+    assert row["request_headers"] == []
+    assert row["request_headers_override_unverified"] is True
+
+
+@pytest.mark.asyncio
+async def test_missing_original_headers_remains_incomplete(runtime_factory):
+    runtime = await runtime_factory().__aenter__()
+
+    class Request(FakeRequest):
+        async def headers_array(self):
+            raise RuntimeError("original headers unavailable")
+
+    runtime._on_request_failed(Request())
+    result = await runtime.close()
+    assert result["status"] == "incomplete"
+    assert metadata(runtime)[0]["request_headers_error"] == "original headers unavailable"
 
 
 @pytest.mark.asyncio
@@ -885,3 +961,52 @@ async def test_native_stop_failure_never_skips_browser_cleanup(runtime_factory, 
     assert runtime._cm.exited
     assert result["status"] == "incomplete"
     assert "native control inaccessible" in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_redirect_response_body_gap_is_self_describing(runtime_factory):
+    """第四阶段 Task 3：redirect 无 body 时记录跳转目标而非静默缺失。"""
+    runtime = await runtime_factory().__aenter__()
+    request = FakeRequest()
+
+    class RedirectResponse(FakeResponse):
+        status = 302
+
+        async def headers_array(self):
+            return [{"name": "Location",
+                     "value": "https://accounts.google.com/v3/signin/identifier"}]
+
+        async def body(self):
+            raise RuntimeError(
+                "Response body is unavailable for redirect responses")
+
+    runtime._on_request(request)
+    runtime._on_response(RedirectResponse(request))
+    await runtime.close()
+    row = metadata(runtime)[0]
+    assert row["body_availability"] == "redirect"
+    assert row["redirect_location"].endswith("/v3/signin/identifier")
+    assert row["response_body_error"]  # 原始错误仍保留
+    # FakeRequest 是带 post_data_buffer 的 POST，request.body 正常落盘；
+    # 这里只断言 redirect 的 response.body 没有落盘。
+    assert not any(path.endswith("response.body") for path in runtime.store.files)
+
+
+@pytest.mark.asyncio
+async def test_non_redirect_body_failure_stays_unavailable(runtime_factory):
+    """非 redirect 的 body 失败保持 unavailable，不被误标。"""
+    runtime = await runtime_factory().__aenter__()
+    request = FakeRequest()
+
+    class FailResponse(FakeResponse):
+        status = 200
+
+        async def body(self):
+            raise RuntimeError("boom")
+
+    runtime._on_request(request)
+    runtime._on_response(FailResponse(request))
+    await runtime.close()
+    row = metadata(runtime)[0]
+    assert row["body_availability"] == "unavailable"
+    assert "redirect_location" not in row

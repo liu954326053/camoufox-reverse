@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>xorigin child</title></head>
+<body>
+<script>
+// 子 frame（跨域）：eval 动态通道跑 FSM 循环 + 逐字符装配，
+// 验证桥回传的不只是 loops，value_taps/string_primitives 也随 drain 聚合。
+eval('var s = 0; while (true) { if (s == 4) break; s++; }');
+eval('var sig = ""; for (var i = 0; i < 8; i++) sig += String.fromCharCode(88, 45, 66, 111, 103, 117, 115, 45);');
+</script>
+</body>
+</html>

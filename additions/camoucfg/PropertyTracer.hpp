@@ -23,6 +23,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -63,7 +64,7 @@ class PropertyTracer {
                   const std::vector<std::string>& objects,
                   uint32_t maxEventsPerSession);
 
-  // Shutdown (call at browser exit)
+  // Drain before normal or immediate process exit; retain the final status ACK.
   void Shutdown();
 
   // ★ Hot path ★ — must be extremely fast
@@ -80,7 +81,7 @@ class PropertyTracer {
     return mEnabled.load(std::memory_order_acquire);
   }
 
-  bool IsInitialized() const { return mInitialized; }
+  bool IsInitialized() const { return mInitialized.load(std::memory_order_acquire); }
 
  private:
   PropertyTracer() = default;
@@ -98,7 +99,7 @@ class PropertyTracer {
   void StartNewSession();
   void StopSession();
   void WriteStatus(const char* state, const char* detail = nullptr);
-  void WriteSessionMetadata(const char* state, const char* detail = nullptr);
+  bool WriteSessionMetadata(const char* state, const char* detail = nullptr);
   bool ShouldRecord(const char* objName) const;
 
   // State
@@ -107,7 +108,8 @@ class PropertyTracer {
   std::atomic<bool> mStop{false};
   std::atomic<uint64_t> mGeneration{0};
   std::atomic<uint32_t> mActiveSessionId{0};
-  bool mInitialized{false};
+  std::atomic<bool> mInitialized{false};
+  std::mutex mLifecycleMutex;
 
   // Config
   std::string mControlPath;
@@ -138,6 +140,48 @@ class PropertyTracer {
   // Background threads
   std::thread mControlThread;
   std::thread mFlushThread;
+};
+
+/*
+ * ScriptExecGuard — RAII script enter/exit recorder.
+ *
+ * Injected at js::ExecuteKernel (js/src/vm/Interpreter.cpp): construction
+ * records a script-enter event, destruction records the matching exit, so
+ * every return path (early return, error) is covered exactly once.
+ *
+ * Event contract (same JSONL as property events):
+ *   o = "script", p = <filename or "anonymous">, v = "line:<n>",
+ *   k = 3 (enter) / 4 (exit), s = injection site id
+ *
+ * Disabled hot path: one atomic load in the constructor, no work in dtor.
+ * The filename pointer borrows JSScript storage; the guard scope is contained
+ * in ExecuteKernel where the script is rooted and alive, and Record copies
+ * the string at record time, so no dangling reads.
+ */
+class ScriptExecGuard {
+ public:
+  ScriptExecGuard(const char* filename, int32_t lineno, const char* site) {
+    PropertyTracer& tracer = PropertyTracer::Instance();
+    mActive = tracer.IsEnabled();
+    if (!mActive) return;
+    mFilename = filename ? filename : "anonymous";
+    mSite = site;
+    std::snprintf(mLine, sizeof(mLine), "line:%d", static_cast<int>(lineno));
+    tracer.Record("script", mFilename, mLine, 3 /* enter */, mSite);
+  }
+  ~ScriptExecGuard() {
+    if (!mActive) return;
+    PropertyTracer::Instance().Record("script", mFilename, mLine,
+                                      4 /* exit */, mSite);
+  }
+  ScriptExecGuard(const ScriptExecGuard&) = delete;
+  ScriptExecGuard& operator=(const ScriptExecGuard&) = delete;
+
+ private:
+  bool mActive{false};
+  const char* mFilename{nullptr};
+  const char* mSite{nullptr};
+  char mLine[24] = {};
 };
 
 }  // namespace camou

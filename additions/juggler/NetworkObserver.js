@@ -435,16 +435,22 @@ class NetworkRequest {
       // For requests with internal redirect (e.g. intercepted by Service Worker),
       // we do not get onResponse normally, but we do get nsIRequestObserver notifications.
       this._sendOnResponse(false);
-      const body = this._responseBodyChunks.join('');
-      const pageNetwork = this._pageNetwork;
-      if (pageNetwork)
-        pageNetwork._responseStorage.addResponseBody(this, body);
+      this._storeReceivedResponseBody();
       this._sendOnRequestFinished();
     } else {
+      // A failed transport can already have delivered bytes. Store those bytes
+      // before notifying consumers; requestFailed remains the completion signal.
+      if (this._sentOnResponse)
+        this._storeReceivedResponseBody();
       this._sendOnRequestFailed(aStatusCode);
     }
 
     delete this._responseBodyChunks;
+  }
+
+  _storeReceivedResponseBody() {
+    if (this._pageNetwork)
+      this._pageNetwork._responseStorage.addResponseBody(this, this._responseBodyChunks.join(''));
   }
 
   _shouldIntercept() {
@@ -499,6 +505,10 @@ class NetworkRequest {
       navigationId: this.navigationId,
       cause: causeTypeToString(causeType),
       internalCause: causeTypeToString(internalCauseType),
+      // reverse8 phase12: engine-level initiator JS stack, or undefined when
+      // the channel was not opened synchronously from page JS (browser UI,
+      // parent-process loads, worker channels, internal retries).
+      initiatorStack: this._networkObserver._initiatorStacks.get(this.httpChannel.channelId + ''),
     }, this._frameId);
   }
 
@@ -572,6 +582,7 @@ class NetworkRequest {
         errorCode: helper.getNetworkErrorStatusText(error),
       }, this._frameId);
     }
+    this._networkObserver._initiatorStacks.delete(this.httpChannel.channelId + '');
     this._networkObserver._channelToRequest.delete(this.httpChannel);
   }
 
@@ -596,6 +607,7 @@ class NetworkRequest {
         protocolVersion,
       }, this._frameId);
     }
+    this._networkObserver._initiatorStacks.delete(this.httpChannel.channelId + '');
     this._networkObserver._channelToRequest.delete(this.httpChannel);
   }
 }
@@ -614,6 +626,23 @@ export class NetworkObserver {
     this._channelToRequest = new Map();  // http channel -> network request
     this._expectedRedirect = new Map();  // expected redirect channel id (string) -> network request
     this._channelIdsFulfilledByServiceWorker = new Set();  // http channel ids that were fulfilled by service worker
+
+    // reverse8 phase12: initiator JS stacks captured in content processes
+    // (InitiatorStackCollector) and forwarded over ppmm, keyed by channelId.
+    // channelId is identical across the content/parent boundary, so stacks
+    // merge into Network.requestWillBeSent without any URL/timing heuristics.
+    this._initiatorStacks = new Map();  // channel id (string) -> stack frame array
+    this._initiatorStackListener = message => {
+      const data = message.data;
+      if (!data || typeof data.channelId !== 'string' || !Array.isArray(data.stack))
+        return;
+      if (this._initiatorStacks.size >= 1000) {
+        // Bound memory: FIFO-evict the oldest entry.
+        this._initiatorStacks.delete(this._initiatorStacks.keys().next().value);
+      }
+      this._initiatorStacks.set(data.channelId, data.stack);
+    };
+    Services.ppmm.addMessageListener('juggler:initiator-stack', this._initiatorStackListener);
 
     const protocolProxyService = Cc['@mozilla.org/network/protocol-proxy-service;1'].getService();
     this._channelProxyFilter = {
@@ -663,6 +692,11 @@ export class NetworkObserver {
       return;
     const oldHttpChannel = oldChannel.QueryInterface(Ci.nsIHttpChannel);
     const newHttpChannel = newChannel.QueryInterface(Ci.nsIHttpChannel);
+    // reverse8 phase12: the initiator stack belongs to the original request;
+    // carry it across redirects to the new channelId (same as DevTools does).
+    const initiatorStack = this._initiatorStacks.get(oldHttpChannel.channelId + '');
+    if (initiatorStack)
+      this._initiatorStacks.set(newHttpChannel.channelId + '', initiatorStack);
     const request = this._channelToRequest.get(oldHttpChannel);
     if (flags & Ci.nsIChannelEventSink.REDIRECT_INTERNAL) {
       if (request)
@@ -714,6 +748,7 @@ export class NetworkObserver {
   }
 
   dispose() {
+    Services.ppmm.removeMessageListener('juggler:initiator-stack', this._initiatorStackListener);
     this._activityDistributor.removeObserver(this);
     ChannelEventSinkFactory.unregister();
     helper.removeListeners(this._eventListeners);
@@ -1063,4 +1098,3 @@ PageNetwork.Events = {
   RequestFinished: Symbol('PageNetwork.Events.RequestFinished'),
   RequestFailed: Symbol('PageNetwork.Events.RequestFailed'),
 };
-

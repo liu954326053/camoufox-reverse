@@ -46,6 +46,7 @@ class InjectorTests(unittest.TestCase):
         return injector.Hook(path, signature, "test", "value")
 
     def _run(self, hooks=(), **kwargs):
+        kwargs.setdefault("include_script_exec", False)
         return injector.run_injection(
             self.root,
             hooks=hooks,
@@ -220,6 +221,7 @@ class InjectorTests(unittest.TestCase):
             self.root,
             hooks=[injector.WEBGL_GET_EXTENSION_HOOK],
             include_audio_sample_rate=False,
+            include_script_exec=False,
             expect_hooks=1,
             ensure_build_files=False,
         )
@@ -245,6 +247,7 @@ class InjectorTests(unittest.TestCase):
             self.root,
             hooks=[],
             include_audio_sample_rate=True,
+            include_script_exec=False,
             expect_hooks=1,
             ensure_build_files=False,
         )
@@ -260,6 +263,7 @@ class InjectorTests(unittest.TestCase):
             self.root,
             hooks=[],
             include_audio_sample_rate=True,
+            include_script_exec=False,
             expect_hooks=1,
             ensure_build_files=False,
         )
@@ -270,6 +274,125 @@ class InjectorTests(unittest.TestCase):
         (self.root / "browser/config/version.txt").write_text("152.0.4-beta.29\n")
         with self.assertRaisesRegex(injector.InjectionError, "source version"):
             self._run([])
+
+
+FAKE_INTERPRETER = (
+    '#include "jsfriendapi.h"\n'
+    "bool js::ExecuteKernel(JSContext* cx, HandleScript script,\n"
+    "                       HandleObject envChainArg, AbstractFramePtr evalInFrame,\n"
+    "                       MutableHandleValue result) {\n"
+    "  if (script->isEmpty()) {\n"
+    "    result.setUndefined();\n"
+    "    return true;\n"
+    "  }\n"
+    "\n"
+    "  ExecuteState state(cx, script, envChainArg, evalInFrame, result);\n"
+    "  return RunScript(cx, state);\n"
+    "}\n"
+)
+
+
+class ScriptExecInjectionTests(unittest.TestCase):
+    """Task 4: SpiderMonkey script enter/exit 注入的契约测试。"""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self._write("browser/config/version.txt", "152.0.4-beta.30\n")
+        self._write("moz.build", 'DIRS += ["lw"]\n')
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _write(self, relative: str, text: str) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        mozbuild = path.parent / "moz.build"
+        if not mozbuild.exists():
+            mozbuild.write_text('FINAL_LIBRARY = "xul"\n', encoding="utf-8")
+        return path
+
+    def _run(self, **kwargs):
+        return injector.run_injection(
+            self.root, hooks=[], include_audio_sample_rate=False,
+            expect_hooks=0, **kwargs,
+        )
+
+    def test_manifest_77_unchanged_and_script_exec_separate(self):
+        # 77 个 DOM 属性 hook 不变；script.exec 独立记账
+        self.assertEqual(len(injector.HOOKS) + 1, 77)
+        self.assertEqual(injector.SCRIPT_EXEC_SITE,
+                         "script.exec@js/src/vm/Interpreter.cpp")
+        self.assertNotIn(injector.SCRIPT_EXEC_SITE,
+                         [hook.site_id for hook in injector.HOOKS])
+
+    def test_fresh_apply_inserts_guard_before_execute_state(self):
+        path = self._write(injector.SCRIPT_EXEC_PATH, FAKE_INTERPRETER)
+        result = self._run()
+        self.assertEqual(result["script_exec"], "applied")
+        text = path.read_text()
+        self.assertIn(injector.SCRIPT_EXEC_MARKER, text)
+        self.assertIn("camou::ScriptExecGuard camouScriptExecGuard", text)
+        # guard 在 ExecuteState 之前；include 已注入
+        self.assertLess(text.index("camouScriptExecGuard"),
+                        text.index("ExecuteState state"))
+        self.assertIn(injector.INCLUDE_LINE, text)
+        # js/src/vm/moz.build 加了 LOCAL_INCLUDES
+        mozbuild = (self.root / "js/src/vm/moz.build").read_text()
+        self.assertEqual(mozbuild.count("/camoucfg"), 1)
+
+    def test_apply_is_idempotent(self):
+        path = self._write(injector.SCRIPT_EXEC_PATH, FAKE_INTERPRETER)
+        first = self._run()
+        after_first = path.read_bytes()
+        second = self._run()
+        self.assertEqual(first["script_exec"], "applied")
+        self.assertEqual(second["script_exec"], "already")
+        self.assertEqual(path.read_bytes(), after_first)
+        self.assertEqual(path.read_text().count(injector.SCRIPT_EXEC_MARKER), 1)
+
+    def test_verify_mode_fails_when_unapplied(self):
+        self._write(injector.SCRIPT_EXEC_PATH, FAKE_INTERPRETER)
+        with self.assertRaisesRegex(injector.InjectionError,
+                                    "verification requires changes"):
+            self._run(mode="verify")
+        self._run()  # apply
+        result = self._run(mode="verify")
+        self.assertEqual(result["script_exec"], "already")
+
+    def test_missing_or_ambiguous_anchor_fails_closed(self):
+        path = self._write(injector.SCRIPT_EXEC_PATH,
+                           "#include <x>\n// no anchor here\n")
+        before = path.read_bytes()
+        with self.assertRaisesRegex(injector.InjectionError, "matched 0 times"):
+            self._run()
+        self.assertEqual(path.read_bytes(), before)  # 原子：不写盘
+
+        self.tearDown()  # 重建一棵有两处 anchor 的树
+        self.setUp()
+        doubled = FAKE_INTERPRETER + FAKE_INTERPRETER
+        path = self._write(injector.SCRIPT_EXEC_PATH, doubled)
+        with self.assertRaisesRegex(injector.InjectionError, "matched 2 times"):
+            self._run()
+
+    def test_opt_out_skips_script_exec(self):
+        self._write(injector.SCRIPT_EXEC_PATH, FAKE_INTERPRETER)
+        result = self._run(include_script_exec=False)
+        self.assertEqual(result["script_exec"], "skipped")
+        self.assertNotIn(injector.SCRIPT_EXEC_MARKER,
+                         (self.root / injector.SCRIPT_EXEC_PATH).read_text())
+
+    def test_guard_contract_in_tracer_header(self):
+        header = (Path(__file__).parents[1]
+                  / "additions/camoucfg/PropertyTracer.hpp").read_text()
+        self.assertIn("class ScriptExecGuard", header)
+        self.assertIn('tracer.Record("script", mFilename, mLine, 3 /* enter */, mSite)',
+                      header)
+        self.assertIn('4 /* exit */', header)
+        # 禁用热路径：构造一次原子加载即返回
+        self.assertIn("if (!mActive) return;", header)
 
 
 if __name__ == "__main__":

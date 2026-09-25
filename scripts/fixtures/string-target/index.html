@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>string taint target fixture</title></head>
+<body>
+<script>
+// 第八阶段验收靶场：VM 风格字符串装配 → 请求字段
+// 片段装配（≥2 字符记事件）：fromCharCode 产出前缀片段
+var frag = String.fromCharCode(115, 105, 103, 45, 118, 50);  // "sig-v2"
+var body = btoa("payload-12345");
+var sig = frag + "." + body;  // "sig-v2.cGF5bG9hZC0xMjM0NQ=="
+// 单字符装配边界演示（只计数不记事件）：逐字符拼 "X-bogus"
+var noise = "";
+var codes = [88, 45, 98, 111, 103, 117, 115];
+for (var i = 0; i < codes.length; i++) noise += String.fromCharCode(codes[i]);
+var xhr = new XMLHttpRequest();
+xhr.open("POST", "/collect");
+xhr.send("sig=" + encodeURIComponent(sig));
+</script>
+</body>
+</html>

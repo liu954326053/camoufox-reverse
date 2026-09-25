@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,219 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 SOURCE = ROOT / "additions" / "camoucfg" / "PropertyTracer.cpp"
 INCLUDE = ROOT / "additions" / "camoucfg"
+SHUTDOWN_PATCH = ROOT / "patches" / "property-tracer-shutdown.patch"
+
+# The Firefox 152 immediate-exit boundary, without unrelated XPCOM services.
+# Apply the shipping patch to this fixture and execute the resulting function.
+SHUTDOWN_FIXTURE = r'''/* immediate exit fixture */
+#include "ShutdownPhase.h"
+#ifdef XP_WIN
+#  include <windows.h>
+#  include "mozilla/PreXULSkeletonUI.h"
+#else
+#  include <unistd.h>
+#endif
+
+void AppShutdown::DoImmediateExit(int aExitCode) {
+#ifdef XP_WIN
+  HANDLE process = ::GetCurrentProcess();
+  if (::TerminateProcess(process, aExitCode)) {
+    ::WaitForSingleObject(process, INFINITE);
+  }
+  MOZ_CRASH("TerminateProcess failed.");
+#else
+  _exit(aExitCode);
+#endif
+}
+'''
+
+EXIT_HARNESS = r'''
+#include "PropertyTracer.hpp"
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <thread>
+#ifdef _WIN32
+#  include <process.h>
+#  define getpid _getpid
+#else
+#  include <unistd.h>
+#endif
+
+// EXIT_BOUNDARY
+
+int RunExit(const std::string& base, const std::string& mode) {
+  auto& tracer = camou::PropertyTracer::Instance();
+  tracer.Initialize(base, {}, mode == "capped" ? 2 : 10000);
+  for (int i = 0; i < 258; ++i) {
+    tracer.Record("navigator", "userAgent", nullptr, 0, "exit@test");
+  }
+  if (mode == "abrupt") {
+    // A killed producer may already have data on disk. Never infer completion.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    std::_Exit(0);
+  }
+  if (mode == "metadata-error") {
+    std::filesystem::create_directory(std::filesystem::u8path(
+        base + "/traces/" + std::to_string(getpid()) + "_0.jsonl.meta.json"));
+  }
+  if (mode == "immediate") {
+    AppShutdown::DoImmediateExit(0);
+  }
+  if (mode == "concurrent") {
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    auto shutdown = [&]() {
+      ready.fetch_add(1);
+      while (!go.load()) std::this_thread::yield();
+      tracer.Shutdown();
+    };
+    std::thread first(shutdown);
+    std::thread second(shutdown);
+    while (ready.load() != 2) std::this_thread::yield();
+    go.store(true);
+    // Hot-path calls may overlap the drain, but cannot append after the ACK.
+    for (int i = 0; i < 4000; ++i) {
+      tracer.Record("navigator", "platform", nullptr, 0, "shutdown-race@test");
+    }
+    first.join();
+    second.join();
+  }
+  if (mode != "destructor") {
+    tracer.Shutdown();
+    tracer.Shutdown();  // Explicit shutdown plus later destructor is idempotent.
+  }
+  return 0;
+}
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) {
+  if (argc != 3) return 2;
+  return RunExit(std::filesystem::path(argv[1]).u8string(),
+                 std::filesystem::path(argv[2]).u8string());
+}
+#else
+int main(int argc, char** argv) {
+  if (argc != 3) return 2;
+  return RunExit(argv[1], argv[2]);
+}
+#endif
+'''
+
+
+def compile_harness(root: Path, source: str, name: str) -> Path:
+    compiler = shutil.which("clang++") if os.name == "nt" else (
+        shutil.which("c++") or shutil.which("g++") or shutil.which("clang++"))
+    if not compiler:
+        raise unittest.SkipTest("no C++ compiler available")
+    harness = root / f"{name}.cpp"
+    binary = root / (f"{name}.exe" if os.name == "nt" else name)
+    harness.write_text(source, encoding="utf-8")
+    subprocess.run([
+        compiler, "-std=c++17",
+        "-D_CRT_SECURE_NO_WARNINGS" if os.name == "nt" else "-pthread",
+        "-Wall", "-Wextra", "-Wpedantic", "-Werror", f"-I{INCLUDE}",
+        str(harness), str(SOURCE), "-o", str(binary),
+    ], check=True, capture_output=True, text=True, timeout=60)
+    return binary
+
+
+class PropertyTracerExitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.root = Path(cls.temporary.name)
+        cls.binary = compile_harness(cls.root, EXIT_HARNESS.replace(
+            "// EXIT_BOUNDARY",
+            "struct AppShutdown { static void DoImmediateExit(int code) "
+            "{ std::_Exit(code); } };"), "native_exit")
+
+    def run_exit(self, mode, binary=None):
+        root = self.root / self._testMethodName
+        root.mkdir()
+        child = subprocess.Popen([str(binary or self.binary), str(root), mode],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            stdout, stderr = child.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            self.fail("native shutdown did not terminate")
+        self.assertEqual(child.returncode, 0, (stdout, stderr))
+        return root, child.pid
+
+    def assert_finalized(self, root, pid, events=258, dropped=0):
+        trace = root / "traces" / f"{pid}_0.jsonl"
+        sidecar = Path(str(trace) + ".meta.json")
+        self.assertTrue(sidecar.is_file(), "exiting process lost its metadata sidecar")
+        metadata = json.loads(sidecar.read_text())
+        self.assertEqual(metadata, {"state": "off", "session_id": 0,
+                                    "events": events, "dropped": dropped})
+        records = [json.loads(line) for line in trace.read_text().splitlines()]
+        self.assertEqual([event["q"] for event in records], list(range(events)))
+        status = root / "control" / f"status-{pid}.state"
+        self.assertTrue(status.is_file(), "exiting process deleted its off ACK")
+        self.assertEqual(parse_status_line(status.read_text()), metadata)
+        self.assertFalse((root / "control" / f"control-{pid}.cmd").exists())
+
+    def test_explicit_shutdown_retains_final_ack(self):
+        self.assert_finalized(*self.run_exit("explicit"))
+
+    def test_destructor_exit_retains_final_ack(self):
+        self.assert_finalized(*self.run_exit("destructor"))
+
+    def test_exit_keeps_event_loss_in_final_ack(self):
+        self.assert_finalized(*self.run_exit("capped"), events=2, dropped=256)
+
+    def test_concurrent_shutdown_and_recording_drain_once(self):
+        root, pid = self.run_exit("concurrent")
+        records = (root / "traces" / f"{pid}_0.jsonl").read_text().splitlines()
+        self.assertGreaterEqual(len(records), 258)
+        self.assertLessEqual(len(records), 4258)
+        self.assert_finalized(root, pid, events=len(records))
+
+    def test_metadata_failure_does_not_acknowledge_clean_stop(self):
+        root, pid = self.run_exit("metadata-error")
+        status = root / "control" / f"status-{pid}.state"
+        self.assertTrue(status.is_file(), "metadata failure lost its final status")
+        self.assertEqual(parse_status_line(status.read_text()).get("detail"), "write_error")
+
+    def test_abrupt_exit_is_not_reported_complete(self):
+        root, pid = self.run_exit("abrupt")
+        trace = root / "traces" / f"{pid}_0.jsonl"
+        self.assertGreater(trace.stat().st_size, 0)
+        self.assertFalse(Path(str(trace) + ".meta.json").exists())
+        status = root / "control" / f"status-{pid}.state"
+        self.assertNotEqual(parse_status_line(status.read_text())["state"], "off")
+
+    def test_patched_immediate_exit_drains_before_terminating(self):
+        self.assertTrue(SHUTDOWN_PATCH.is_file(), "Firefox immediate exit has no tracer shutdown hook")
+        patch = shutil.which("patch")
+        if not patch:
+            self.skipTest("patch command unavailable")
+        fixture = self.root / "patch-fixture"
+        source = fixture / "xpcom/base/AppShutdown.cpp"
+        source.parent.mkdir(parents=True)
+        source.write_text(SHUTDOWN_FIXTURE)
+        subprocess.run([patch, "--batch", "--forward", "-p1", "-i", str(SHUTDOWN_PATCH)],
+                       cwd=fixture, check=True, capture_output=True, text=True)
+        patched = source.read_text()
+        boundary = re.search(r"void AppShutdown::DoImmediateExit\(int aExitCode\) \{.*?\n\}",
+                             patched, re.S).group()
+        preamble = '''
+#ifdef _WIN32
+#include <windows.h>
+#define XP_WIN
+#define MOZ_CRASH(message) std::abort()
+#endif
+struct AppShutdown { static void DoImmediateExit(int); };
+'''
+        binary = compile_harness(self.root, EXIT_HARNESS.replace(
+            "// EXIT_BOUNDARY", preamble + boundary), "patched_exit")
+        self.assert_finalized(*self.run_exit("immediate", binary))
 
 HARNESS = r"""
 #include "PropertyTracer.hpp"
@@ -232,7 +446,10 @@ class PropertyTracerRuntimeTests(unittest.TestCase):
             self.assertEqual({event["k"] for event in normal_sessions[2]}, {0})
             self.assertEqual([len(events) for events in loss_sessions], [2])
             self.assertEqual(list(trace_root.rglob("control-*.cmd")), [])
-            self.assertEqual(list(trace_root.rglob("status-*.state")), [])
+            final_statuses = list(trace_root.rglob("status-*.state"))
+            self.assertEqual(len(final_statuses), 3)
+            for status in final_statuses:
+                self.assertEqual(parse_status_line(status.read_text())["state"], "off")
 
             loss_metadata = list(
                 (trace_root / "loss-status" / "traces").glob("*.meta.json")

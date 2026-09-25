@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>wasm target fixture</title></head>
+<body>
+<script>
+// 第六阶段验收靶场：四个 WebAssembly 入口全部用到
+// test.wasm = (module (func (export "run") (result i32) i32.const 7))
+fetch("/test.wasm").then(function(r) {
+    return WebAssembly.instantiateStreaming(r, { env: { cb: function() { return 1; } } });
+}).then(function(res) {
+    window.__streaming_result = res.instance.exports.run();
+});
+fetch("/test.wasm").then(function(r) { return r.arrayBuffer(); }).then(function(buf) {
+    // compile → instantiate(module) 形态
+    WebAssembly.compile(buf).then(function(mod) {
+        WebAssembly.instantiate(mod, {}).then(function(inst) {
+            window.__module_result = inst.exports.run();
+        });
+    });
+    // instantiate(bytes) 形态
+    WebAssembly.instantiate(buf, {}).then(function(res) {
+        window.__bytes_result = res.instance.exports.run();
+    });
+});
+WebAssembly.compileStreaming(fetch("/test.wasm")).then(function() {
+    window.__compile_streaming_done = true;
+});
+// 一个 while 循环，让评分卡第 2/10 条也有料
+var __s = 0; while (__s < 5) { __s++; }
+</script>
+</body>
+</html>

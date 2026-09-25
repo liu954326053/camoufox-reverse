@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from camoufox import reverse_launch_options
+from camoufox.reverse_compat import BROWSER_SELECTOR
 from camoufox.reverse_evidence import EvidenceError, EvidenceStore
 from camoufox.reverse_project import ReverseProject
 
@@ -23,11 +24,11 @@ def test_project_launch_and_incomplete_session_recovery(tmp_path, monkeypatch):
     options, second_session = reverse_launch_options(
         project_dir=project_dir,
         trace_profile="targeted",
-        browser_version="whitenightshadow/152.0.4-beta.30-reverse.5",
+        browser_version=BROWSER_SELECTOR,
     )
 
     assert second_session.session_id != first_session.session_id
-    assert options["browser"] == "whitenightshadow/152.0.4-beta.30-reverse.5"
+    assert options["browser"] == BROWSER_SELECTOR
     assert options["config"]["propertyTrace"]["logDir"] == str(
         second_session.trace_dir
     )

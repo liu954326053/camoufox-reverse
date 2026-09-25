@@ -2,7 +2,8 @@
   "schema": 1,
   "distribution": "WhiteNightShadow/camoufox-reverse",
   "upstream_version": "152.0.4-beta.30",
-  "reverse_release": "reverse.5",
+  "browser_selector": "whitenightshadow/152.0.4-beta.30-reverse.9",
+  "reverse_release": "reverse.9",
   "property_trace": true,
   "property_trace_protocol": 1,
   "property_trace_hooks": 77,
@@ -25,6 +26,7 @@
     "loss_status",
     "durable_loss_metadata",
     "utf8_paths",
-    "process_scope"
+    "process_scope",
+    "script_exec_events"
   ]
 }

@@ -7,6 +7,7 @@ import pytest
 
 from camoufox import launch_options as ordinary_launch_options
 from camoufox import reverse_launch_options
+from camoufox.reverse_compat import BROWSER_SELECTOR
 from camoufox.utils import validate_config
 
 
@@ -26,6 +27,7 @@ def test_reverse_launch_points_property_trace_inside_session(tmp_path, monkeypat
 
     assert options["config"]["propertyTrace"]["logDir"] == str(session.trace_dir)
     assert options["config"]["propertyTrace"]["enabled"] is True
+    assert options["browser"] == BROWSER_SELECTOR
     assert session.trace_dir == session.path / "trace"
     assert session.trace_dir.is_dir()
 
@@ -66,6 +68,7 @@ def test_reverse_launch_no_trace_omits_property_trace_config(tmp_path, monkeypat
     )
 
     assert "propertyTrace" not in options["config"]
+    assert options["browser"] == BROWSER_SELECTOR
     assert not session.trace_dir.exists()
 
 

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>taint target fixture</title></head>
+<body>
+<script>
+// 第七阶段验收靶场：加密参数链路 采集→变换→落地
+// raw → TextEncoder → digest(SHA-256) → hex（未包装 JS）→ btoa → POST 字段
+async function main() {
+    var raw = "uid=12345&ts=" + Date.now();
+    var enc = new TextEncoder().encode(raw);
+    var dig = await crypto.subtle.digest("SHA-256", enc);
+    var hex = Array.prototype.map.call(new Uint8Array(dig), function(b) {
+        return ("0" + b.toString(16)).slice(-2);
+    }).join("");
+    var sig = btoa(hex);        // 88 字符，走哈希匹配路径
+    var uid = btoa("12345");    // 8 字符，短值
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/collect");
+    xhr.send("sig=" + sig + "&uid=" + uid);
+}
+main();
+// VM 形态循环，让评分卡第 2/10 条有料
+var s = 0; while (true) { if (s == 5) break; s++; }
+</script>
+</body>
+</html>

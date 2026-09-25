@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>opcode seq target fixture</title></head>
+<body>
+<script>
+// 第九阶段验收靶场：VM 风格派发函数 Du(l,p,c) 跑 opcode 序列。
+// 经 eval 进入（动态代码通道：tick 插桩 + 代码补丁都在这条通道上），
+// 探针带 --code-patches 锚 Du 入口，__mcp_vm_rec 记录有序序列与参数。
+var program = [3, 1, 4, 1, 5, 9, 2, 6];
+eval('function Du(l,p,c){ l.Y[p] = c; }');
+var vm = { Y: {} };
+for (var i = 0; i < program.length; i++) Du(vm, program[i], i);
+// 一段 while(true) FSM 让循环通道也有料（eval 动态注入）
+eval('var s = 0; while (true) { if (s == 3) break; s++; }');
+</script>
+</body>
+</html>

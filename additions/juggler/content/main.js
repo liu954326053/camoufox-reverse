@@ -14,11 +14,12 @@ Services.scriptloader.loadSubScript('chrome://juggler/content/content/Runtime.js
 const {Helper} = ChromeUtils.importESModule('chrome://juggler/content/Helper.js');
 const {FrameTree} = ChromeUtils.importESModule('chrome://juggler/content/content/FrameTree.js');
 const {PageAgent} = ChromeUtils.importESModule('chrome://juggler/content/content/PageAgent.js');
+const {InitiatorStackCollector} = ChromeUtils.importESModule('chrome://juggler/content/content/InitiatorStackCollector.js');
 
 const helper = new Helper();
 
 export function initialize(browsingContext, docShell) {
-  const data = { channel: undefined, pageAgent: undefined, frameTree: undefined, failedToOverrideTimezone: false };
+  const data = { channel: undefined, pageAgent: undefined, frameTree: undefined, initiatorStackCollector: undefined, failedToOverrideTimezone: false };
 
   const applySetting = {
     geolocation: (geolocation) => {
@@ -82,6 +83,9 @@ export function initialize(browsingContext, docShell) {
   data.frameTree.setInitScripts([...contextCrossProcessCookie.initScripts, ...pageCrossProcessCookie.initScripts]);
   data.channel = new SimpleChannel('', 'process-' + Services.appinfo.processID);
   data.pageAgent = new PageAgent(data.channel, data.frameTree);
+  // reverse8 phase12: capture engine-level initiator stacks for this tab's
+  // network requests (chrome-side observer, zero page-world pollution).
+  data.initiatorStackCollector = new InitiatorStackCollector(browsingContext);
   docShell.fileInputInterceptionEnabled = !!pageCrossProcessCookie.interceptFileChooserDialog;
 
   data.channel.register('', {

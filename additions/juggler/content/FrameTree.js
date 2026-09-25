@@ -20,9 +20,15 @@ const helper = new Helper();
 // so a caller's leading `mw:` ends up *inside* the arrow function, where it is a
 // label statement -- valid JavaScript that parses, runs, and does nothing. That
 // is why the prefix appeared to be accepted on init scripts while changing
-// nothing (#738). Match the prefix in both positions: wrapped, as Playwright
-// sends it, and bare, as a direct Juggler client would.
+// nothing (#738). Newer Playwright also prepends a once-per-document guard.
+// Recognize that exact preamble, not arbitrary occurrences of `mw:` in code.
 const INIT_SCRIPT_WRAPPER = /^\s*\(\(\)\s*=>\s*\{([\s\S]*)\}\)\(\);?\s*$/;
+const INIT_SCRIPT_GUARD = new RegExp(
+  String.raw`^globalThis\.__pwInitScripts\s*=\s*globalThis\.__pwInitScripts\s*\|\|\s*\{\s*\};\s*` +
+  String.raw`const\s+hasInitScript\s*=\s*globalThis\.__pwInitScripts\[("[a-f0-9]{32}")\];\s*` +
+  String.raw`if\s*\(hasInitScript\)\s*return;\s*` +
+  String.raw`globalThis\.__pwInitScripts\[\1\]\s*=\s*true;\s*`
+);
 const MAIN_WORLD_PREFIX = 'mw:';
 
 // Returns the script with the prefix stripped when it asks for the main world,
@@ -30,9 +36,13 @@ const MAIN_WORLD_PREFIX = 'mw:';
 function mainWorldInitScript(script) {
   const wrapped = INIT_SCRIPT_WRAPPER.exec(script);
   const body = (wrapped ? wrapped[1] : script).trimStart();
-  if (!body.startsWith(MAIN_WORLD_PREFIX))
+  const guard = wrapped && INIT_SCRIPT_GUARD.exec(body);
+  const prefixOffset = guard ? guard[0].length : 0;
+  if (!body.slice(prefixOffset).startsWith(MAIN_WORLD_PREFIX))
     return null;
-  return body.slice(MAIN_WORLD_PREFIX.length);
+  const source = body.slice(0, prefixOffset) + body.slice(prefixOffset + MAIN_WORLD_PREFIX.length);
+  // Keep the guard's return legal and its bindings local to this init script.
+  return wrapped ? `(() => {\n${source}\n})();` : source;
 }
 
 export class FrameTree {
@@ -853,6 +863,5 @@ function channelId(channel) {
   }
   return helper.generateId();
 }
-
 
 

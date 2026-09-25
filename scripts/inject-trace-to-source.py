@@ -167,6 +167,21 @@ AUDIO_INLINE = "float SampleRate() const { return mSampleRate; }"
 AUDIO_DECL = "float SampleRate() const;"
 AUDIO_DEF = "float AudioContext::SampleRate() const {"
 AUDIO_ANCHOR = "double AudioContext::OutputLatency() {"
+
+# SpiderMonkey 深度执行事件（第二阶段 Task 4）：顶层脚本 enter/exit。
+# 不属于 77 个 DOM 属性 hook 清单，单独记账、单独开关；注入点是
+# ExecuteKernel 进入 ExecuteState 之前，RAII guard 覆盖所有返回路径。
+SCRIPT_EXEC_PATH = "js/src/vm/Interpreter.cpp"
+SCRIPT_EXEC_SITE = f"script.exec@{SCRIPT_EXEC_PATH}"
+SCRIPT_EXEC_MARKER = f"/* PropertyTracer injected: {SCRIPT_EXEC_SITE} */"
+SCRIPT_EXEC_ANCHOR = (
+    "  ExecuteState state(cx, script, envChainArg, evalInFrame, result);"
+)
+SCRIPT_EXEC_GUARD = (
+    "  camou::ScriptExecGuard camouScriptExecGuard(\n"
+    f'      script->filename(), script->lineno(), "{SCRIPT_EXEC_SITE}");\n'
+    f"  {SCRIPT_EXEC_MARKER}\n"
+)
 DEPRECATED_SITE_PATHS = {
     "dom/storage/LocalStorage.cpp": (
         "localStorage.getItem@dom/storage/LocalStorage.cpp",
@@ -383,6 +398,32 @@ def _apply_audio(plan: SourcePlan) -> str:
     return "already" if already else "applied"
 
 
+def _apply_script_exec(plan: SourcePlan) -> str:
+    """Inject the ScriptExecGuard into js::ExecuteKernel (idempotent)."""
+    text = plan.read(SCRIPT_EXEC_PATH)
+    marker_count = text.count(SCRIPT_EXEC_MARKER)
+    if marker_count > 1:
+        raise InjectionError(
+            f"duplicate {SCRIPT_EXEC_SITE}: marker={marker_count}"
+        )
+    if marker_count == 1:
+        if "camouScriptExecGuard" not in text:
+            raise InjectionError(f"partial {SCRIPT_EXEC_SITE}: marker without guard")
+        plan.set(SCRIPT_EXEC_PATH, _ensure_include(text))
+        return "already"
+    anchor_count = text.count(SCRIPT_EXEC_ANCHOR)
+    if anchor_count != 1:
+        raise InjectionError(
+            f"{SCRIPT_EXEC_SITE} anchor matched {anchor_count} times; expected 1"
+        )
+    plan.set(
+        SCRIPT_EXEC_PATH,
+        _ensure_include(text.replace(SCRIPT_EXEC_ANCHOR,
+                                     SCRIPT_EXEC_GUARD + SCRIPT_EXEC_ANCHOR, 1)),
+    )
+    return "applied"
+
+
 def _ensure_local_include(plan: SourcePlan, source_path: str) -> None:
     mozbuild = str(Path(source_path).parent / "moz.build")
     text = plan.read(mozbuild)
@@ -457,6 +498,7 @@ def run_injection(
     expect_hooks: int = DEFAULT_EXPECT_HOOKS,
     hooks: Sequence[Hook] | None = None,
     include_audio_sample_rate: bool = True,
+    include_script_exec: bool = True,
     ensure_build_files: bool = True,
 ) -> dict[str, object]:
     """Validate, plan and optionally apply the injection.
@@ -510,6 +552,11 @@ def run_injection(
         raise InjectionError(
             f"postcondition failed: applied={applied}, already={already}, expected={expect_hooks}"
         )
+    # Task 4：SpiderMonkey script enter/exit，独立于 77 个 DOM 属性 hook 记账
+    script_exec_status = "skipped"
+    if include_script_exec:
+        script_exec_status = _apply_script_exec(plan)
+        source_paths.add(SCRIPT_EXEC_PATH)
     if ensure_build_files:
         for source_path in sorted(source_paths):
             _ensure_local_include(plan, source_path)
@@ -530,6 +577,7 @@ def run_injection(
         "expected": expect_hooks,
         "applied": applied,
         "already": already,
+        "script_exec": script_exec_status,
         "files_changed": [
             str(path.relative_to(plan.root))
             for path in sorted(changes, key=str)

@@ -152,7 +152,7 @@ def write_mcp_example(
 
 def _default_paths() -> tuple[Path, Path]:
     root = Path(__file__).resolve().parents[1]
-    source = root / "integrations" / "camoufox-reverse-skill"
+    source = root / "skill"
     codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     target = codex_home / "skills" / "camoufox-reverse-browser"
     return source, target

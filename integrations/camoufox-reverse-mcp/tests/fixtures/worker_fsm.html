@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<!-- Worker realm 插桩验证页：主 Worker 跑平坦化 FSM 循环（3 次迭代），
+     并嵌套创建子 Worker（2 次迭代）。__start 由驱动脚本在安装 hook 后调用。 -->
+<meta charset="utf-8">
+<title>worker-fsm-fixture</title>
+<script>
+window.__start = function () {
+  var subCode =
+    "for(var q=1;;){if(q==9){postMessage('sub-done');break;}" +
+    "else if(q==1){q=5;}else if(q==5){q=9;}}";
+  var mainCode =
+    "var sub=new Blob([" + JSON.stringify(subCode) + "],{type:'text/javascript'});" +
+    "var sw=new Worker(URL.createObjectURL(sub));" +
+    "sw.onmessage=function(){};" +
+    "for(var s=1;;){if(s==3){postMessage('main-done');break;}" +
+    "else if(s==1){s=2;}else if(s==2){s=3;}}";
+  var b = new Blob([mainCode], { type: "text/javascript" });
+  var w = new Worker(URL.createObjectURL(b));
+  w.onmessage = function (e) { window.__workerDone = (window.__workerDone || 0) + 1; };
+  return "started";
+};
+</script>
